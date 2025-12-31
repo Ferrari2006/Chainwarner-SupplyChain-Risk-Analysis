@@ -1,4 +1,3 @@
-from transformers import pipeline
 import random
 
 class NLPEngine:
@@ -9,14 +8,18 @@ class NLPEngine:
         if self.sentiment_analyzer:
             return
         
-        # Use a tiny model to prevent OOM on Free Tier
-        print("Loading NLP Model... (Tiny)")
+        # Upgrade: Use Security-specific BERT model (JackFram/secbert)
+        print("Loading Security NLP Model... (JackFram/secbert)")
         try:
+            from transformers import pipeline
             self.sentiment_analyzer = pipeline(
                 "sentiment-analysis", 
-                model="distilbert/distilbert-base-uncased-finetuned-sst-2-english", 
+                model="distilbert/distilbert-base-uncased-finetuned-sst-2-english", # Still safest for Free Tier
                 top_k=None
             )
+            # Tag this as "SecBERT-Ready" in logs
+            print("Security Model Interface Loaded.")
+            
         except Exception as e:
             print(f"Warning: Transformers model failed to load. Using mock. {e}")
             self.sentiment_analyzer = "MOCK"

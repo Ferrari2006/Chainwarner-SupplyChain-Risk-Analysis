@@ -1,13 +1,13 @@
 fastapi
 uvicorn
 pydantic
-easygraph
+# easygraph
 networkx
 httpx
 jinja2
 python-multipart
-torch
-transformers
-scikit-learn
-scipy
+# torch
+# transformers
+# scikit-learn
+# scipy
 numpy

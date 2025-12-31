@@ -3,12 +3,14 @@ from app.models.graph import GraphData, Node, Edge
 from app.engines.graph_engine import GraphEngine
 from app.engines.ml_engine import MLEngine
 from app.engines.nlp_engine import NLPEngine
+from app.engines.agent_engine import AgentEngine
 from app.core.stream_processor import stream_processor
 import httpx
 import random
-import torch
+# import torch # Removed to prevent OOM on Render Free Tier
 from functools import lru_cache
 import asyncio
+from pydantic import BaseModel
 
 router = APIRouter()
 
@@ -16,8 +18,14 @@ router = APIRouter()
 graph_engine = GraphEngine()
 ml_engine = MLEngine()
 nlp_engine = NLPEngine()
+agent_engine = AgentEngine()
 
-# Global Cache (Simple Dictionary for Async compatibility)
+# --- Models ---
+class ChatRequest(BaseModel):
+    query: str
+    context_repo: str # e.g. "facebook/react"
+
+# --- Endpoints ---
 # lru_cache blocks execution if used on async functions directly without wrapper
 ANALYSIS_CACHE = {}
 
@@ -55,16 +63,43 @@ PREDEFINED_RISKS = {
     "ant-design/ant-design": 36.8
 }
 
-async def fetch_github_file(owner: str, repo: str, path: str):
-    """Fetch raw file content from GitHub (e.g. package.json)"""
-    url = f"https://raw.githubusercontent.com/{owner}/{repo}/HEAD/{path}"
+async def fetch_repo_file(owner: str, repo: str, path: str):
+    """
+    Multi-Source Fusion: Fetch raw file from GitHub -> Gitee -> GitLab (Waterfall)
+    """
     async with httpx.AsyncClient() as client:
+        # 1. Try GitHub (Primary)
+        github_url = f"https://raw.githubusercontent.com/{owner}/{repo}/HEAD/{path}"
         try:
-            resp = await client.get(url, timeout=5.0)
+            resp = await client.get(github_url, timeout=3.0)
             if resp.status_code == 200:
+                print(f"[Fusion] Fetched from GitHub: {github_url}")
                 return resp.text
         except:
             pass
+
+        # 2. Try Gitee (China Mirror)
+        # Gitee raw structure: gitee.com/owner/repo/raw/master/path
+        gitee_url = f"https://gitee.com/{owner}/{repo}/raw/master/{path}"
+        try:
+            resp = await client.get(gitee_url, timeout=3.0)
+            if resp.status_code == 200:
+                print(f"[Fusion] Fetched from Gitee: {gitee_url}")
+                return resp.text
+        except:
+            pass
+
+        # 3. Try GitLab (Alternative)
+        # GitLab raw structure: gitlab.com/owner/repo/-/raw/main/path
+        gitlab_url = f"https://gitlab.com/{owner}/{repo}/-/raw/main/{path}"
+        try:
+            resp = await client.get(gitlab_url, timeout=3.0)
+            if resp.status_code == 200:
+                print(f"[Fusion] Fetched from GitLab: {gitlab_url}")
+                return resp.text
+        except:
+            pass
+            
     return None
 
 def parse_dependencies(content: str, file_type: str):
@@ -128,17 +163,17 @@ async def get_dependency_graph(owner: str, repo: str):
     dependencies = []
     
     # Try package.json (Node.js)
-    pkg_json = await fetch_github_file(owner, repo, "package.json")
+    pkg_json = await fetch_repo_file(owner, repo, "package.json")
     if pkg_json:
         dependencies = parse_dependencies(pkg_json, 'json')
     else:
         # Try requirements.txt (Python)
-        req_txt = await fetch_github_file(owner, repo, "requirements.txt")
+        req_txt = await fetch_repo_file(owner, repo, "requirements.txt")
         if req_txt:
             dependencies = parse_dependencies(req_txt, 'txt')
         else:
             # Try pyproject.toml (Python modern) - simplified
-            toml_txt = await fetch_github_file(owner, repo, "pyproject.toml")
+            toml_txt = await fetch_repo_file(owner, repo, "pyproject.toml")
             if toml_txt:
                 # Basic parsing for toml to avoid heavy lib
                 import re
@@ -302,43 +337,69 @@ async def get_leaderboard():
     ]
     
     # Try to inject recently analyzed high-risk projects from cache
-    for repo_name, graph_data in list(ANALYSIS_CACHE.items())[:5]:
+    for repo_name, graph_data in list(ANALYSIS_CACHE.items())[:10]: # Check last 10 analyzed
         # Find root node
         root = next((n for n in graph_data.nodes if n.id == repo_name), None)
-        if root and root.risk_score > 0.6:
-            # Check if already in list
-            if not any(item['name'] == repo_name for item in critical_list):
-                critical_list.append({
-                    "rank": 99, # Placeholder, re-sort later
+        if root:
+            # Inject High Risk into Critical List
+            if root.risk_score > 0.6:
+                if not any(item['name'] == repo_name for item in critical_list):
+                    critical_list.append({
+                        "rank": 99, 
+                        "name": repo_name,
+                        "risk": round(root.risk_score * 100, 1),
+                        "reason": "Recently Analyzed"
+                    })
+            
+            # Inject Low Risk into Stars List
+            # Only inject if safer than the worst item on the current list (approx < 0.4)
+            elif root.risk_score < 0.4: 
+                # Define stars_list reference to modify it below
+                pass # Logic handled in next block to avoid scope issues
+    
+    stars_list = [
+        {"rank": 1, "name": "torvalds/linux", "risk": 5.2, "reason": "Extremely Active Audit"},
+        {"rank": 2, "name": "kubernetes/kubernetes", "risk": 8.1, "reason": "CNCF Graduated"},
+        {"rank": 3, "name": "facebook/react", "risk": 12.4, "reason": "Corporate Backing"},
+        {"rank": 4, "name": "tensorflow/tensorflow", "risk": 15.3, "reason": "Google Security Team"},
+        {"rank": 5, "name": "microsoft/vscode", "risk": 18.7, "reason": "Frequent Updates"},
+        {"rank": 6, "name": "flutter/flutter", "risk": 20.2, "reason": "Strong Community"},
+        {"rank": 7, "name": "golang/go", "risk": 22.5, "reason": "Google Maintained"},
+        {"rank": 8, "name": "rust-lang/rust", "risk": 23.8, "reason": "Memory Safety"},
+        {"rank": 9, "name": "denoland/deno", "risk": 25.1, "reason": "Secure by Default"},
+        {"rank": 10, "name": "nodejs/node", "risk": 28.4, "reason": "Mature Ecosystem"},
+        {"rank": 11, "name": "electron/electron", "risk": 30.6, "reason": "Sandboxing"},
+        {"rank": 12, "name": "tauri-apps/tauri", "risk": 32.2, "reason": "Rust Backend"},
+        {"rank": 13, "name": "vercel/next.js", "risk": 33.9, "reason": "Rapid Patching"},
+        {"rank": 14, "name": "nestjs/nest", "risk": 35.5, "reason": "Enterprise Grade"},
+        {"rank": 15, "name": "ant-design/ant-design", "risk": 36.8, "reason": "Consistent Quality"}
+    ]
+
+    # Inject Low Risk Cache into Stars List
+    for repo_name, graph_data in list(ANALYSIS_CACHE.items())[:10]:
+        root = next((n for n in graph_data.nodes if n.id == repo_name), None)
+        if root and root.risk_score < 0.4:
+             if not any(item['name'] == repo_name for item in stars_list):
+                stars_list.append({
+                    "rank": 99,
                     "name": repo_name,
                     "risk": round(root.risk_score * 100, 1),
-                    "reason": "Recently Analyzed"
+                    "reason": "Safe Architecture"
                 })
-    
-    # Re-sort and slice
+
+    # Re-sort and slice Critical
     critical_list.sort(key=lambda x: x['risk'], reverse=True)
     for i, item in enumerate(critical_list):
+        item['rank'] = i + 1
+
+    # Re-sort and slice Stars (Ascending Risk)
+    stars_list.sort(key=lambda x: x['risk'], reverse=False)
+    for i, item in enumerate(stars_list):
         item['rank'] = i + 1
     
     return {
         "critical": critical_list[:15],
-        "stars": [
-            {"rank": 1, "name": "torvalds/linux", "risk": 5.2, "reason": "Extremely Active Audit"},
-            {"rank": 2, "name": "kubernetes/kubernetes", "risk": 8.1, "reason": "CNCF Graduated"},
-            {"rank": 3, "name": "facebook/react", "risk": 12.4, "reason": "Corporate Backing"},
-            {"rank": 4, "name": "tensorflow/tensorflow", "risk": 15.3, "reason": "Google Security Team"},
-            {"rank": 5, "name": "microsoft/vscode", "risk": 18.7, "reason": "Frequent Updates"},
-            {"rank": 6, "name": "flutter/flutter", "risk": 20.2, "reason": "Strong Community"},
-            {"rank": 7, "name": "golang/go", "risk": 22.5, "reason": "Google Maintained"},
-            {"rank": 8, "name": "rust-lang/rust", "risk": 23.8, "reason": "Memory Safety"},
-            {"rank": 9, "name": "denoland/deno", "risk": 25.1, "reason": "Secure by Default"},
-            {"rank": 10, "name": "nodejs/node", "risk": 28.4, "reason": "Mature Ecosystem"},
-            {"rank": 11, "name": "electron/electron", "risk": 30.6, "reason": "Sandboxing"},
-            {"rank": 12, "name": "tauri-apps/tauri", "risk": 32.2, "reason": "Rust Backend"},
-            {"rank": 13, "name": "vercel/next.js", "risk": 33.9, "reason": "Rapid Patching"},
-            {"rank": 14, "name": "nestjs/nest", "risk": 35.5, "reason": "Enterprise Grade"},
-            {"rank": 15, "name": "ant-design/ant-design", "risk": 36.8, "reason": "Consistent Quality"}
-        ],
+        "stars": stars_list[:15],
         "alerts": [
             "🚨 [Critical] New RCE vulnerability detected in 'fastjson' (CVE-2025-XXXX).",
             "⚠️ [Warning] 'colors.js' maintainer account suspicious activity detected.",
@@ -346,3 +407,24 @@ async def get_leaderboard():
             "📉 [Trend] 'request' library activity dropped by 40% in last month."
         ]
     }
+
+@router.post("/chat")
+async def chat_with_agent(req: ChatRequest):
+    """
+    Intelligent Data Analysis Agent
+    """
+    # 1. Retrieve Context
+    context_data = ANALYSIS_CACHE.get(req.context_repo)
+    
+    # If not cached, we can't answer accurately (or we trigger a fetch, but that's slow)
+    if not context_data:
+        return {"response": f"I haven't analyzed **{req.context_repo}** yet. Please run the analysis first!"}
+    
+    # 2. Serialize Context for Agent
+    # Convert Pydantic model to dict
+    context_dict = context_data.dict()
+    
+    # 3. Process Query
+    answer = agent_engine.process_query(req.query, context_dict)
+    
+    return {"response": answer}
