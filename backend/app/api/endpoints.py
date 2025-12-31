@@ -27,10 +27,13 @@ async def fetch_opendigger_metric(repo_name: str, metric: str):
     url = f"{OPENDIGGER_BASE_URL}/{repo_name}/{metric}.json"
     async with httpx.AsyncClient() as client:
         try:
-            resp = await client.get(url, timeout=3.0) # Faster timeout
+            resp = await client.get(url, timeout=5.0) # Increased timeout slightly
             if resp.status_code == 200:
                 return resp.json()
-        except:
+            else:
+                print(f"OpenDigger API Error: {resp.status_code} for {url}")
+        except Exception as e:
+            print(f"OpenDigger Fetch Failed: {e}")
             pass
     return None
 
@@ -51,8 +54,13 @@ async def get_dependency_graph(owner: str, repo: str):
         return ANALYSIS_CACHE[repo_full_name]
     
     # --- 1. Data Collection Phase ---
-    activity = await fetch_opendigger_metric(repo_full_name, "activity")
-    openrank = await fetch_opendigger_metric(repo_full_name, "openrank")
+    try:
+        activity = await fetch_opendigger_metric(repo_full_name, "activity")
+        openrank = await fetch_opendigger_metric(repo_full_name, "openrank")
+    except Exception as e:
+        print(f"Data Collection Failed: {e}")
+        activity = None
+        openrank = None
     
     base_score = 0.5
     if activity:
