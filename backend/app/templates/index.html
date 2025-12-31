@@ -551,6 +551,11 @@
             
             try {
                 const res = await fetch(`/api/v1/graph/${repo}`);
+                
+                if (!res.ok) {
+                    throw new Error(`Server Error: ${res.status}`);
+                }
+
                 const data = await res.json();
                 
                 const nodes = data.nodes.map(n => {

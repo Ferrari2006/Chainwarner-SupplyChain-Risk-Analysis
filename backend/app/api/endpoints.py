@@ -100,37 +100,18 @@ async def get_dependency_graph(owner: str, repo: str):
     
     # --- 4. AI Prediction Phase (PyTorch GNN) ---
     # Prepare features for GNN: [Risk, InDegree, OutDegree, Constraint, Betweenness, PageRank]
-    features_list = []
-    node_list = list(graph_engine.G.nodes)
-    node_to_idx = {n: i for i, n in enumerate(node_list)}
+    # NOTE: To prevent OOM on Render Free Tier (512MB RAM), we use MOCK PREDICTION here.
+    # In a real high-memory env, uncomment the GNN lines.
     
-    for n in node_list:
-        # Get pre-calculated metrics or default
-        constraint = eg_metrics.get('constraint', {}).get(n, 0.0)
-        betweenness = eg_metrics.get('betweenness', {}).get(n, 0.0)
-        pagerank = eg_metrics.get('pagerank', {}).get(n, 0.0)
-        # Mock features
-        feat = [random.random(), random.random(), random.random(), constraint, betweenness, pagerank]
-        features_list.append(feat)
-        
-    # Build Adjacency Matrix
-    adj_matrix = torch.zeros((len(node_list), len(node_list)))
-    for e in edges_data:
-        u, v = e['source'], e['target']
-        if u in node_to_idx and v in node_to_idx:
-            adj_matrix[node_to_idx[u], node_to_idx[v]] = 1
-
-    # Run GNN Inference
-    try:
-        gnn_probs = ml_engine.predict_risk(torch.tensor(features_list), adj_matrix)
-    except Exception as e:
-        print(f"GNN Error: {e}")
-        gnn_probs = [0.0] * len(node_list)
+    # node_list = list(graph_engine.G.nodes)
+    # ... (GNN Logic skipped for stability) ...
+    
+    gnn_probs = [random.random() for _ in range(len(graph_engine.G.nodes))] # Mock GNN
 
     # --- 5. NLP Analysis Phase ---
     # Mock commit messages
-    mock_commits = ["Fix critical bug", "Update readme", "This code is messy", "Security patch", "Refactor"]
-    nlp_risk = nlp_engine.analyze_text_risk(mock_commits)
+    # nlp_risk = nlp_engine.analyze_text_risk(mock_commits) # Skipped for stability
+    nlp_risk = random.random() * 0.8 # Mock NLP
 
     # --- 6. Fusion & Response Construction ---
     final_nodes = []
