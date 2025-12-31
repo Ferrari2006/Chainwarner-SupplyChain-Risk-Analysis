@@ -33,7 +33,17 @@ class GraphEngine:
         try:
             # Try EasyGraph first
             if USE_EASYGRAPH:
+                # EasyGraph constraint might return NaN for disconnected nodes or small graphs
                 constraint = eg.constraint(self.G)
+                # Fill missing/NaN values
+                all_nodes = list(self.G.nodes)
+                for n in all_nodes:
+                    if n not in constraint or constraint[n] != constraint[n]: # Check for NaN
+                        # Fallback heuristic: High degree ~ High constraint
+                        deg = self.G.degree(n)
+                        max_deg = len(self.G) - 1
+                        val = (deg / max_deg) if max_deg > 0 else 0.0
+                        constraint[n] = val
                 metrics['constraint'] = constraint
             else:
                 # Use NetworkX directly if EasyGraph is missing
@@ -41,14 +51,11 @@ class GraphEngine:
                 metrics['constraint'] = nx.constraint(self.G)
         except Exception as e:
             print(f"EasyGraph/NetworkX constraint failed: {e}")
-            # Fallback: Manually calculate simplified Constraint (Sum of dyadic constraints)
-            # C_i = sum( (p_ij + sum(p_iq * p_qj))^2 )
-            # This is a complex calculation, so we use a simpler heuristic for fallback:
-            # Degree Centrality as a proxy for "Constraint" (High Degree ~ High Constraint in dense clusters)
+            # Fallback: Degree Centrality as a proxy
             try:
-                metrics['constraint'] = {n: deg / (len(self.G) - 1) for n, deg in self.G.degree()}
+                metrics['constraint'] = {n: (self.G.degree(n) / max(1, len(self.G) - 1)) for n in self.G.nodes}
             except:
-                metrics['constraint'] = {}
+                metrics['constraint'] = {n: 0.0 for n in self.G.nodes}
 
         # 2. Betweenness Centrality
         # Identifies nodes that control information flow.

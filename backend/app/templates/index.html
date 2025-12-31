@@ -212,6 +212,50 @@
             transform: translateY(-50%); font-size: 10px; color: rgba(255,255,255,0.8);
             display: none; /* Hidden because we use unicode char in select or simple layout */
         }
+
+        /* 5. Chat Agent Widget */
+        .chat-widget {
+            position: fixed; bottom: 20px; right: 20px; z-index: 9999;
+            display: flex; flex-direction: column; align-items: flex-end;
+        }
+        .chat-toggle {
+            width: 50px; height: 50px; background: var(--primary); border-radius: 50%;
+            display: flex; align-items: center; justify-content: center;
+            color: white; font-size: 24px; cursor: pointer; box-shadow: 0 4px 12px rgba(0,0,0,0.5);
+            transition: transform 0.2s;
+        }
+        .chat-toggle:hover { transform: scale(1.1); }
+        .chat-window {
+            width: 300px; height: 400px; background: #1f1f1f; border: 1px solid #333;
+            border-radius: 8px; margin-bottom: 15px; display: none;
+            flex-direction: column; overflow: hidden; box-shadow: 0 4px 20px rgba(0,0,0,0.6);
+        }
+        .chat-header {
+            padding: 10px; background: #141414; border-bottom: 1px solid #333;
+            font-weight: bold; color: #ddd; display: flex; justify-content: space-between;
+        }
+        .chat-body {
+            flex: 1; padding: 10px; overflow-y: auto; display: flex; flex-direction: column; gap: 10px;
+        }
+        .chat-input-area {
+            padding: 10px; border-top: 1px solid #333; display: flex; gap: 5px;
+        }
+        .chat-input {
+            flex: 1; background: #000; border: 1px solid #444; color: white;
+            padding: 5px; border-radius: 4px; outline: none;
+        }
+        .chat-msg {
+            padding: 8px 12px; border-radius: 15px; font-size: 13px; max-width: 80%;
+            line-height: 1.4;
+        }
+        .chat-msg.user {
+            background: var(--primary); color: white; align-self: flex-end;
+            border-bottom-right-radius: 2px;
+        }
+        .chat-msg.bot {
+            background: #333; color: #ddd; align-self: flex-start;
+            border-bottom-left-radius: 2px;
+        }
     </style>
 </head>
 <body>
@@ -382,6 +426,24 @@
         </div>
     </div>
 
+    <!-- Chat Widget -->
+    <div class="chat-widget">
+        <div class="chat-window" id="chat-window">
+            <div class="chat-header">
+                <span>🤖 智能分析助手</span>
+                <span style="cursor:pointer;" onclick="toggleChat()">×</span>
+            </div>
+            <div class="chat-body" id="chat-body">
+                <div class="chat-msg bot">你好！我是 ChainWarner 智能助手。你可以问我关于当前项目的风险评分、依赖关系或改进建议。</div>
+            </div>
+            <div class="chat-input-area">
+                <input type="text" id="chat-input" class="chat-input" placeholder="输入问题..." onkeypress="handleChatKey(event)">
+                <button onclick="sendChat()" style="background:var(--primary); border:none; color:white; border-radius:4px; cursor:pointer;">→</button>
+            </div>
+        </div>
+        <div class="chat-toggle" onclick="toggleChat()">💬</div>
+    </div>
+
     <script>
         let graph;
         let radarChart;
@@ -480,6 +542,66 @@
                 downloadReport(format);
                 select.value = ""; // Reset selection
             }
+        }
+
+        // --- Chat Logic ---
+        function toggleChat() {
+            const win = document.getElementById('chat-window');
+            if (win.style.display === 'flex') {
+                win.style.display = 'none';
+            } else {
+                win.style.display = 'flex';
+            }
+        }
+
+        function handleChatKey(e) {
+            if (e.key === 'Enter') sendChat();
+        }
+
+        async function sendChat() {
+            const input = document.getElementById('chat-input');
+            const query = input.value.trim();
+            if (!query) return;
+
+            // Add User Message
+            addChatMsg(query, 'user');
+            input.value = '';
+
+            // Loading
+            const loadingId = addChatMsg("思考中...", 'bot');
+
+            try {
+                // Get current repo context
+                const repo = document.getElementById('repoInput').value;
+                
+                const res = await fetch('/api/v1/chat', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({ query: query, context_repo: repo })
+                });
+                
+                const data = await res.json();
+                
+                // Remove loading
+                document.getElementById(loadingId).remove();
+                
+                // Add Bot Response
+                addChatMsg(data.response, 'bot');
+                
+            } catch (e) {
+                document.getElementById(loadingId).innerText = "Error: 无法连接到智能体。";
+            }
+        }
+
+        function addChatMsg(text, type) {
+            const body = document.getElementById('chat-body');
+            const div = document.createElement('div');
+            div.className = `chat-msg ${type}`;
+            div.id = 'msg-' + Date.now();
+            div.innerHTML = text.replace(/\*\*(.*?)\*\*/g, '<b>$1</b>'); // Simple bold parsing
+            body.appendChild(div);
+            body.scrollTop = body.scrollHeight;
+            return div.id;
         }
 
         // --- Report Download ---
