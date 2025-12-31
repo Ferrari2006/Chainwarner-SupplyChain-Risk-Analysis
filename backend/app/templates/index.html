@@ -65,9 +65,13 @@
         .lb-tab.active { color: var(--primary); border-bottom: 2px solid var(--primary); }
         
         .lb-list { list-style: none; padding: 0; margin: 0; }
+        /* Fix: Allow scrolling if content overflows, but hide scrollbar for clean look */
+        .lb-list::-webkit-scrollbar { width: 0; background: transparent; }
         .lb-item { 
-            display: flex; justify-content: space-between; align-items: center; padding: 6px 4px; 
+            display: flex; justify-content: space-between; align-items: center; padding: 4px 4px; 
             border-bottom: 1px solid #222; cursor: pointer; transition: background 0.2s;
+            /* Fix: Reduce height to fit 5 items */
+            height: 40px; 
         }
         .lb-item:hover { background: #2a2a2a; }
         .lb-rank { width: 18px; text-align: center; font-weight: bold; color: #888; font-size: 12px; }
@@ -124,6 +128,90 @@
         }
         .close { color: #aaa; float: right; font-size: 28px; font-weight: bold; cursor: pointer; }
         .close:hover { color: white; }
+
+        /* --- New Features CSS --- */
+        
+        /* 1. Tooltips */
+        .tooltip-container { position: relative; display: inline-flex; align-items: center; cursor: help; }
+        .info-icon { margin-left: 5px; color: #888; transition: color 0.3s; }
+        .info-icon:hover { color: var(--primary); }
+        .tooltip-text {
+            visibility: hidden; width: 300px; background-color: rgba(0,0,0,0.95);
+            color: #fff; text-align: left; border-radius: 6px; padding: 12px;
+            position: fixed; /* Fixed position to break out of container overflow */
+            z-index: 9999;
+            opacity: 0; transition: opacity 0.3s;
+            font-size: 13px; line-height: 1.6; border: 1px solid #555;
+            pointer-events: none;
+            white-space: normal;
+            box-shadow: 0 8px 24px rgba(0,0,0,0.8);
+            transform: translateY(-100%); /* Move up */
+            margin-top: -10px; /* Spacing */
+        }
+        .tooltip-container:hover .tooltip-text { visibility: visible; opacity: 1; }
+
+        /* 3. Improved Ticker */
+        .ticker-wrap {
+            width: 100%; overflow: hidden; white-space: nowrap; position: relative;
+            height: 20px; display: flex; align-items: center;
+            mask-image: linear-gradient(to right, transparent, black 10%, black 90%, transparent);
+            -webkit-mask-image: linear-gradient(to right, transparent, black 10%, black 90%, transparent);
+        }
+        .ticker {
+            display: inline-block; white-space: nowrap;
+            padding-left: 100%; animation: ticker 30s linear infinite;
+        }
+        .ticker:hover { animation-play-state: paused; }
+        .ticker-item {
+            display: inline-block; padding: 0 20px; color: #ccc; font-size: 12px;
+            border-right: 1px solid #333;
+        }
+        .ticker-item:last-child { border-right: none; }
+        @keyframes ticker {
+            0% { transform: translate3d(0, 0, 0); }
+            100% { transform: translate3d(-100%, 0, 0); }
+        }
+
+        /* 4. Download Group - Select Style */
+        .download-group {
+            position: absolute; top: 20px; right: 20px; z-index: 10;
+            display: flex; gap: 0; background: rgba(0,0,0,0.6);
+            border-radius: 20px; backdrop-filter: blur(4px);
+            align-items: center; padding: 0;
+            border: 1px solid #444; overflow: hidden;
+        }
+        .download-btn-main {
+            background: var(--accent); color: white; border: none; padding: 8px 15px;
+            cursor: pointer; font-size: 13px; font-weight: bold;
+            display: flex; align-items: center; gap: 5px;
+            border-right: 1px solid rgba(0,0,0,0.2);
+            transition: background 0.2s;
+        }
+        .download-btn-main:hover { background: #9254de; }
+        
+        .download-select-wrapper {
+            position: relative;
+            background: var(--accent);
+            height: 100%; display: flex; align-items: center;
+            cursor: pointer; transition: background 0.2s;
+        }
+        .download-select-wrapper:hover { background: #9254de; }
+        
+        .download-select {
+            appearance: none; -webkit-appearance: none;
+            background: transparent; border: none; color: white;
+            padding: 8px 10px; font-size: 12px; cursor: pointer;
+            width: 30px; text-align: center; font-weight: bold;
+            outline: none;
+        }
+        .download-select option { background: #1f1f1f; color: #ddd; padding: 5px; }
+        
+        /* Arrow icon for select */
+        .download-arrow {
+            pointer-events: none; position: absolute; right: 8px; top: 50%; 
+            transform: translateY(-50%); font-size: 10px; color: rgba(255,255,255,0.8);
+            display: none; /* Hidden because we use unicode char in select or simple layout */
+        }
     </style>
 </head>
 <body>
@@ -140,8 +228,12 @@
             </div>
         </div>
 
-        <div style="font-size: 12px; color: #888; width: 200px; text-align: right; overflow: hidden; white-space: nowrap; text-overflow: ellipsis;">
-            <span id="alert-ticker" class="alert-ticker" style="position: static; animation: none; color: #ff4d4f;">正在连接全球安全情报网络...</span>
+        <div style="width: 350px; overflow: hidden;">
+            <div class="ticker-wrap">
+                <div id="alert-ticker" class="ticker">
+                    <span class="ticker-item">正在连接全球安全情报网络...</span>
+                </div>
+            </div>
         </div>
     </div>
     
@@ -155,11 +247,25 @@
                     <span id="detail-name" style="color: white;">-</span>
                 </div>
                 <div class="metric-row">
-                    <span>综合风险评分:</span>
+                    <span class="tooltip-container">综合风险评分 <svg class="info-icon" viewBox="0 0 1024 1024" width="14" height="14" fill="currentColor"><path d="M512 64a448 448 0 1 1 0 896 448 448 0 0 1 0-896zm0 832a384 384 0 1 0 0-768 384 384 0 0 0 0 768zm-48-424a48 48 0 1 1 96 0v208a48 48 0 1 1-96 0V472zm48-152a56 56 0 1 1 0 112 56 56 0 0 1 0-112z"/></svg>
+                        <span class="tooltip-text">
+                            <strong>风险评分说明:</strong><br>
+                            0-40: ✅ 安全 (Low Risk)<br>
+                            40-70: ⚠️ 警告 (Medium Risk)<br>
+                            70-100: 🚨 高危 (Critical)<br>
+                            基于 CVE、活跃度及图谱结构综合计算。
+                        </span>
+                    </span>
                     <span id="detail-risk" class="risk-val" style="color: #f5222d;">-</span>
                 </div>
                 <div class="metric-row">
-                    <span>结构洞约束 (Constraint):</span>
+                    <span class="tooltip-container">结构洞约束 (Constraint) <svg class="info-icon" viewBox="0 0 1024 1024" width="14" height="14" fill="currentColor"><path d="M512 64a448 448 0 1 1 0 896 448 448 0 0 1 0-896zm0 832a384 384 0 1 0 0-768 384 384 0 0 0 0 768zm-48-424a48 48 0 1 1 96 0v208a48 48 0 1 1-96 0V472zm48-152a56 56 0 1 1 0 112 56 56 0 0 1 0-112z"/></svg>
+                        <span class="tooltip-text">
+                            <strong>Burt结构洞指标:</strong><br>
+                            数值越接近 1，表示该节点越受限于其邻居（缺乏自主性）。<br>
+                            数值越接近 0，表示该节点处于开放的结构洞位置（具有信息优势）。
+                        </span>
+                    </span>
                     <span id="detail-constraint" class="risk-val">-</span>
                 </div>
                 
@@ -184,12 +290,25 @@
         
         <!-- 中间：图谱可视化区 -->
         <div class="main-content">
-            <button onclick="downloadReport()" class="download-btn">📄 下载安全审计报告</button>
+            <div class="download-group">
+                <button onclick="downloadReport('pdf')" class="download-btn-main">
+                    📄 下载报告 (PDF)
+                </button>
+                <div class="download-select-wrapper">
+                    <select id="download-format" class="download-select" onchange="handleFormatSelect(this)">
+                        <option value="" disabled selected>▼</option>
+                        <option value="md">Markdown (.md)</option>
+                        <option value="json">JSON Data (.json)</option>
+                        <option value="txt">Plain Text (.txt)</option>
+                        <option value="doc">Word Doc (.doc)</option>
+                    </select>
+                </div>
+            </div>
             <div id="graph-container"></div>
             
             <div class="loader" id="loader">
                 <div class="spinner"></div>
-                <p style="margin-top: 10px;">正在运行 GNN 推理 & 结构洞计算...</p>
+                <p style="margin-top: 10px; line-height: 1.5;">正在连接全球开源数据库...<br><span style="font-size: 12px; color: #aaa;">实时分析可能需要 10-30 秒，请耐心等待</span></p>
             </div>
 
             <div class="legend">
@@ -208,7 +327,7 @@
                     <div class="lb-tab active" onclick="switchTab('critical')">⚠️ 高危榜</div>
                     <div class="lb-tab" onclick="switchTab('stars')">🌟 安全榜</div>
                 </div>
-                <ul id="lb-list" class="lb-list" style="flex: 1; overflow-y: hidden; display: flex; flex-direction: column; justify-content: space-between;">
+                <ul id="lb-list" class="lb-list" style="flex: 1; overflow-y: auto; display: flex; flex-direction: column; justify-content: flex-start; gap: 4px;">
                     <li style="text-align:center; padding: 20px; color: #666;">加载中...</li>
                 </ul>
                 <div style="text-align: center; margin-top: 5px; padding-top: 5px; border-top: 1px solid #222;">
@@ -269,6 +388,21 @@
         let lineChart;
         let leaderboardData = {};
         let currentModalTab = 'critical';
+        let currentNodeData = null;
+
+        // Tooltip Positioning Logic
+        document.addEventListener('mouseover', function(e) {
+            const target = e.target.closest('.tooltip-container');
+            if (target) {
+                const tooltip = target.querySelector('.tooltip-text');
+                if (tooltip) {
+                    const rect = target.getBoundingClientRect();
+                    // Set position dynamically based on viewport
+                    tooltip.style.left = Math.min(rect.left, window.innerWidth - 320) + 'px'; 
+                    tooltip.style.top = rect.top + 'px';
+                }
+            }
+        });
 
         function init() {
             initGraph();
@@ -340,21 +474,81 @@
             }
         }
 
+        function handleFormatSelect(select) {
+            const format = select.value;
+            if (format) {
+                downloadReport(format);
+                select.value = ""; // Reset selection
+            }
+        }
+
         // --- Report Download ---
-        function downloadReport() {
-            const name = document.getElementById('detail-name').innerText;
-            if (!name || name === '-') {
+        function downloadReport(format) {
+            if (!currentNodeData) {
                 alert("请先选择一个项目进行分析");
                 return;
             }
             
+            const name = currentNodeData.full_name;
+            const date = new Date().toLocaleString();
+            
+            let content = "";
+            let type = "text/plain";
+            let ext = "txt";
+
+            // Common Text Content Generation
             const risk = document.getElementById('detail-risk').innerText;
             const constraint = document.getElementById('detail-constraint').innerText;
             const aiMsg = document.getElementById('ai-msg').innerText;
-            
-            const date = new Date().toLocaleString();
-            
-            const report = `
+
+            const textContent = `
+========================================
+🛡️ ChainWarner 安全审计报告
+========================================
+
+生成时间: ${date}
+目标项目: ${name}
+
+----------------------------------------
+1. 核心风险评估
+----------------------------------------
+- 综合风险评分: ${risk}%
+- 结构洞约束系数: ${constraint}
+- AI 预测结论:
+  ${aiMsg}
+
+----------------------------------------
+2. 详细指标分析
+----------------------------------------
+该项目的六维能力雷达图显示其在社区响应速度和代码维护持续性方面表现... (见线上仪表盘)
+
+----------------------------------------
+3. 历史趋势
+----------------------------------------
+过去 6 个月的风险演化数据显示波动趋势，建议持续监控。
+
+========================================
+Generated by ChainWarner v3.0
+========================================
+`;
+
+            if (format === 'json') {
+                const reportObj = {
+                    project: name,
+                    generated_at: date,
+                    metrics: {
+                        risk_score: currentNodeData.risk,
+                        constraint: document.getElementById('detail-constraint').innerText,
+                        ai_analysis: document.getElementById('ai-msg').innerText
+                    },
+                    history: currentNodeData.history,
+                    radar_data: radarChart ? radarChart.getOption().series[0].data[0].value : []
+                };
+                content = JSON.stringify(reportObj, null, 2);
+                type = "application/json";
+                ext = "json";
+            } else if (format === 'md') {
+                content = `
 # 🛡️ ChainWarner 安全审计报告
 
 **生成时间**: ${date}
@@ -376,13 +570,49 @@
 
 ---
 *Generated by ChainWarner v3.0*
-            `;
+`;
+                type = "text/markdown";
+                ext = "md";
+            } else if (format === 'doc') {
+                // Simple HTML-based Word Doc
+                content = `
+                <html xmlns:o='urn:schemas-microsoft-com:office:office' xmlns:w='urn:schemas-microsoft-com:office:word' xmlns='http://www.w3.org/TR/REC-html40'>
+                <head><meta charset='utf-8'><title>Report</title></head><body>
+                <h1>🛡️ ChainWarner 安全审计报告</h1>
+                <p><strong>生成时间:</strong> ${date}</p>
+                <p><strong>目标项目:</strong> ${name}</p>
+                <hr>
+                <h2>1. 核心风险评估</h2>
+                <ul>
+                    <li><strong>综合风险评分:</strong> ${risk}%</li>
+                    <li><strong>结构洞约束系数:</strong> ${constraint}</li>
+                    <li><strong>AI 预测结论:</strong><br><em>${aiMsg}</em></li>
+                </ul>
+                <h2>2. 详细指标分析</h2>
+                <p>该项目的六维能力雷达图显示其在社区响应速度和代码维护持续性方面表现... (见线上仪表盘)</p>
+                <h2>3. 历史趋势</h2>
+                <p>过去 6 个月的风险演化数据显示波动趋势，建议持续监控。</p>
+                <hr>
+                <p><em>Generated by ChainWarner v3.0</em></p>
+                </body></html>`;
+                type = "application/msword";
+                ext = "doc";
+            } else if (format === 'pdf') {
+                // Browser Print to PDF (Simulated)
+                window.print(); 
+                return; // Let browser handle PDF via print dialog
+            } else {
+                // TXT
+                content = textContent;
+                type = "text/plain";
+                ext = "txt";
+            }
             
-            const blob = new Blob([report], { type: 'text/markdown' });
+            const blob = new Blob([content], { type: type });
             const url = URL.createObjectURL(blob);
             const a = document.createElement('a');
             a.href = url;
-            a.download = `ChainWarner_Report_${name.replace('/','_')}.md`;
+            a.download = `ChainWarner_Report_${name.replace('/','_')}.${ext}`;
             document.body.appendChild(a);
             a.click();
             document.body.removeChild(a);
@@ -396,8 +626,15 @@
                 
                 // Update Alert Ticker
                 if (leaderboardData.alerts && leaderboardData.alerts.length > 0) {
-                    const tickerText = leaderboardData.alerts.join("   |   ");
-                    document.getElementById('alert-ticker').innerText = tickerText;
+                    const tickerContainer = document.getElementById('alert-ticker');
+                    tickerContainer.innerHTML = ''; // Clear loading text
+                    
+                    leaderboardData.alerts.forEach(alert => {
+                        const span = document.createElement('span');
+                        span.className = 'ticker-item';
+                        span.innerText = alert;
+                        tickerContainer.appendChild(span);
+                    });
                 }
             } catch (e) {
                 console.error("Failed to load leaderboard", e);
@@ -589,11 +826,13 @@
         }
 
         function updateDetails(node) {
+            currentNodeData = node;
             // document.getElementById('node-details').style.display = 'block'; // No longer needed as it is always visible
             document.getElementById('detail-name').innerText = node.full_name;
             
             // Fix: Handle null/undefined risk scores safely
             const safeRisk = node.risk !== undefined && node.risk !== null ? node.risk : 0.5;
+            // Backend now returns 0.0-1.0, so multiply by 100 for display percentage
             document.getElementById('detail-risk').innerText = (safeRisk * 100).toFixed(1);
             document.getElementById('detail-risk').style.color = getRiskColor(safeRisk);
             
@@ -603,7 +842,7 @@
             document.getElementById('detail-constraint').innerText = constraint;
 
             // 模拟雷达图数据（基于风险分反推）
-            const safeScore = (1 - node.risk) * 100;
+            const safeScore = (1 - safeRisk) * 100;
             const radarData = [
                 Math.min(100, safeScore + Math.random()*20), // 活跃度
                 safeScore, // 安全性
@@ -620,6 +859,7 @@
             }
             
             // 更新折线图
+            // Backend history is already 0-100 scale, so NO multiplier needed here!
             if (node.history && lineChart) {
                 lineChart.setOption({
                     series: [{ data: node.history }]
@@ -628,7 +868,7 @@
 
             // AI 消息动态化
             const aiMsg = document.getElementById('ai-msg');
-            if (node.risk > 0.7) {
+            if (safeRisk > 0.7) {
                 aiMsg.innerText = "⚠️ 警告：GNN 模型检测到该项目依赖结构脆弱，且 EasyGraph 算出其 Constraint 值异常，建议立即替换。";
                 aiMsg.style.color = "#ff4d4f";
             } else {
