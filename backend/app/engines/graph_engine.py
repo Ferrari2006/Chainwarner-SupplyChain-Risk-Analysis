@@ -49,6 +49,16 @@ class GraphEngine:
                 # Use NetworkX directly if EasyGraph is missing
                 import networkx as nx
                 metrics['constraint'] = nx.constraint(self.G)
+                
+                # NetworkX constraint also returns NaN for isolated/leaf nodes
+                # We need to sanitize this just like we did for EasyGraph
+                for n, val in metrics['constraint'].items():
+                    if val != val: # Check for NaN
+                         # Fallback heuristic: High degree ~ High constraint
+                        deg = self.G.degree(n)
+                        max_deg = len(self.G) - 1
+                        val = (deg / max_deg) if max_deg > 0 else 0.0
+                        metrics['constraint'][n] = val
         except Exception as e:
             print(f"EasyGraph/NetworkX constraint failed: {e}")
             # Fallback: Degree Centrality as a proxy

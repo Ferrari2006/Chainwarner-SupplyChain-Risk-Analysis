@@ -245,58 +245,80 @@ async def get_dependency_graph(owner: str, repo: str):
 
     # --- 6. Fusion & Response Construction ---
     final_nodes = []
+    
+    # Pre-calculate Max Values for Normalization
+    max_openrank = 1000.0
+    if openrank:
+        max_openrank = max(max(openrank.values()), 100.0) # Avoid div by zero
+        
+    max_activity = 50.0
+    if activity:
+        max_activity = max(max(activity.values()), 10.0)
+
     for i, n_id in enumerate(node_list):
-        # Fusion Strategy: Weighted Sum of GNN, NLP, and Static Metrics
-        # Ensure fallback random values if GNN mock failed
-        # HARDCODED FIX: Always use random if list is short
-        gnn_score = gnn_probs[i] if i < len(gnn_probs) else random.uniform(0.1, 0.9)
-        
-        # Ensure static score has a value
-        if i < len(nodes_data):
-            static_score = nodes_data[i].get('risk_score', 0.5)
-        else:
-            static_score = 0.5
-        
-        # Calculate centrality boost safely
-        centrality_val = eg_metrics.get('betweenness', {}).get(n_id, 0)
-        centrality_boost = centrality_val * 2.0
-        
-        # Calculate Final Risk (Weights: GNN=40%, Static=40%, NLP=10%, Centrality=10%)
-        # All inputs are 0.0-1.0
-        final_risk = (gnn_score * 0.4) + (static_score * 0.4) + (nlp_risk * 0.1) + (centrality_boost * 0.1)
-        
-        # Force a minimum risk for demo purposes (so it's never 0.00 unless perfectly safe)
-        if final_risk < 0.05: 
-            final_risk = random.uniform(0.1, 0.3)
+        # 1. Base Metrics (From OpenDigger or Mock if lib)
+        if n_id == repo_full_name:
+            # Target Project: Use REAL Data
+            # OpenRank Score (Higher OpenRank = Lower Risk)
+            current_openrank = list(openrank.values())[-1] if openrank else 0
+            norm_openrank = min(1.0, current_openrank / max_openrank)
+            score_openrank = 1.0 - norm_openrank 
             
-        final_risk = min(1.0, max(0.0, final_risk))
+            # Activity Score (Higher Activity = Lower Risk)
+            current_activity = list(activity.values())[-1] if activity else 0
+            norm_activity = min(1.0, current_activity / max_activity)
+            score_activity = 1.0 - norm_activity
+            
+        else:
+            # Dependency Lib: Use Heuristic based on name length/hash (Mock for now, but deterministic)
+            # In production, we would fetch OpenDigger for EVERY dependency too.
+            random.seed(n_id) # Deterministic Seed!
+            score_openrank = random.uniform(0.2, 0.8)
+            score_activity = random.uniform(0.2, 0.8)
+            
+        # 2. Topology Metrics (From EasyGraph)
+        # Constraint (Structural Hole): Higher Constraint = Higher Risk (Closed community)
+        constraint_val = eg_metrics.get('constraint', {}).get(n_id, 0)
+        # Normalize constraint (usually 0-1, but can be higher)
+        score_constraint = min(1.0, constraint_val)
         
-        # CONSISTENCY FIX: Override with Predefined Risk if available
-        # This ensures the Detail View matches the Leaderboard exactly.
-        if n_id in PREDEFINED_RISKS:
-            final_risk = PREDEFINED_RISKS[n_id] / 100.0
+        # Betweenness Centrality: Higher Centrality = Higher Impact Risk
+        betweenness_val = eg_metrics.get('betweenness', {}).get(n_id, 0)
+        # Normalize betweenness (usually small)
+        score_centrality = min(1.0, betweenness_val * 5.0) # Boost for visibility
+
+        # 3. Weighted Fusion Model (Deterministic)
+        # Weights: OpenRank(40%) + Activity(30%) + Constraint(20%) + Centrality(10%)
+        final_risk = (score_openrank * 0.4) + \
+                     (score_activity * 0.3) + \
+                     (score_constraint * 0.2) + \
+                     (score_centrality * 0.1)
         
-        # Generate History (Mock evolution based on current score)
-        # Simulate a trend: Random walk from 6 months ago to now
-        # SCALING FIX: History should match the 0-100 scale used in frontend display if needed,
-        # but backend usually stores 0-1.0. 
-        # The user complained about mismatch. 
-        # Frontend multiplies risk by 100 (0.5 -> 50.0). 
-        # Let's ensure history is also 0.0-1.0 here, and frontend handles display scaling consistently.
+        final_risk = min(1.0, max(0.05, final_risk)) # Keep between 0.05 and 1.0
+        
+        # CONSISTENCY FIX: Override with Predefined Risk if available (Fallback only)
+        # Only use predefined if we have NO real data (e.g. network failure)
+        if not openrank and not activity and n_id in PREDEFINED_RISKS:
+             final_risk = PREDEFINED_RISKS[n_id] / 100.0
+        
+        # Generate History (Deterministic Trend based on Risk Score)
         history = []
         current = final_risk
+        random.seed(n_id + "history") # Deterministic history
         for _ in range(6):
-            # Store as 0-100 for direct ECharts consumption to avoid confusion
             history.insert(0, float(f"{current * 100:.1f}"))
-            current = current + (random.random() - 0.5) * 0.2 # Random change
+            # Trend mimics risk: High risk tends to be volatile
+            volatility = 0.1 if final_risk > 0.5 else 0.05
+            change = (random.random() - 0.5) * volatility
+            current = current + change
             current = min(1.0, max(0.0, current))
 
         final_nodes.append(Node(
             id=n_id,
-            label="Project", # Simplified for frontend
+            label="Project", 
             name=n_id,
             risk_score=final_risk,
-            description=f"Constraint: {eg_metrics.get('constraint', {}).get(n_id, 0):.2f}",
+            description=f"Constraint: {constraint_val:.2f} | Rank: {score_openrank:.2f}",
             history=history
         ))
 
@@ -428,3 +450,43 @@ async def chat_with_agent(req: ChatRequest):
     answer = agent_engine.process_query(req.query, context_dict)
     
     return {"response": answer}
+
+@router.get("/compare/{owner1}/{repo1}/{owner2}/{repo2}")
+async def compare_projects(owner1: str, repo1: str, owner2: str, repo2: str):
+    """
+    Ecosystem Battle: Compare two projects side-by-side.
+    Returns OpenRank trends and Activity scores.
+    """
+    r1_name = f"{owner1}/{repo1}"
+    r2_name = f"{owner2}/{repo2}"
+    
+    # Fetch Data in Parallel
+    results = await asyncio.gather(
+        stream_processor.fetch_and_store(r1_name, "openrank"),
+        stream_processor.fetch_and_store(r1_name, "activity"),
+        stream_processor.fetch_and_store(r2_name, "openrank"),
+        stream_processor.fetch_and_store(r2_name, "activity")
+    )
+    
+    r1_rank, r1_act, r2_rank, r2_act = results
+    
+    # Format for Frontend (Last 6 months)
+    def process_series(data):
+        if not data: return [0]*6
+        # Take last 6 values, pad with 0 if needed
+        vals = list(data.values())
+        if len(vals) >= 6: return vals[-6:]
+        return [0]*(6-len(vals)) + vals
+        
+    return {
+        "repo1": {
+            "name": r1_name,
+            "openrank": process_series(r1_rank),
+            "activity": list(r1_act.values())[-1] if r1_act else 0
+        },
+        "repo2": {
+            "name": r2_name,
+            "openrank": process_series(r2_rank),
+            "activity": list(r2_act.values())[-1] if r2_act else 0
+        }
+    }

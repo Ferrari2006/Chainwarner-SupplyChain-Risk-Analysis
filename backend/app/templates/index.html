@@ -256,6 +256,28 @@
             background: #333; color: #ddd; align-self: flex-start;
             border-bottom-left-radius: 2px;
         }
+
+        /* 6. Compare Modal */
+        #compareModal .modal-content {
+            width: 80%; max-width: 1000px;
+        }
+        .compare-container {
+            display: flex; gap: 20px; padding: 20px 0;
+        }
+        .compare-col {
+            flex: 1; display: flex; flex-direction: column; align-items: center;
+        }
+        .compare-input {
+            background: #000; border: 1px solid #444; color: white; padding: 8px; 
+            width: 100%; border-radius: 4px; margin-bottom: 10px;
+        }
+        .compare-chart-box {
+            width: 100%; height: 300px; background: #141414; border: 1px solid #333;
+            border-radius: 8px; padding: 10px;
+        }
+        .vs-badge {
+            font-size: 24px; font-weight: bold; color: var(--accent); margin: auto 0;
+        }
     </style>
 </head>
 <body>
@@ -272,11 +294,41 @@
             </div>
         </div>
 
-        <div style="width: 350px; overflow: hidden;">
-            <div class="ticker-wrap">
-                <div id="alert-ticker" class="ticker">
-                    <span class="ticker-item">正在连接全球安全情报网络...</span>
+        <div style="display: flex; align-items: center; gap: 15px;">
+            <button onclick="openCompareModal()" style="background: linear-gradient(90deg, #722ed1, #1890ff); border: none; color: white; padding: 6px 15px; border-radius: 4px; cursor: pointer; font-weight: bold;">
+                ⚔️ 生态 PK
+            </button>
+            <div style="width: 200px; overflow: hidden;">
+                <div class="ticker-wrap">
+                    <div id="alert-ticker" class="ticker">
+                        <span class="ticker-item">正在连接全球安全情报网络...</span>
+                    </div>
                 </div>
+            </div>
+        </div>
+    </div>
+    
+    <!-- Compare Modal -->
+    <div id="compareModal" class="modal">
+        <div class="modal-content">
+            <span class="close" onclick="closeCompareModal()">&times;</span>
+            <h2 style="color: var(--primary); border-bottom: 1px solid #333; padding-bottom: 10px;">⚔️ 生态影响力大对决</h2>
+            <div class="compare-container">
+                <div class="compare-col">
+                    <input type="text" id="comp-repo1" class="compare-input" value="facebook/react">
+                    <h3 id="comp-score1" style="color: #1890ff;">Rank: -</h3>
+                </div>
+                <div class="vs-badge">VS</div>
+                <div class="compare-col">
+                    <input type="text" id="comp-repo2" class="compare-input" value="vuejs/vue">
+                    <h3 id="comp-score2" style="color: #f5222d;">Rank: -</h3>
+                </div>
+            </div>
+            <button onclick="runComparison()" style="width: 100%; padding: 10px; background: var(--primary); border: none; color: white; cursor: pointer; font-weight: bold; border-radius: 4px;">开始对比</button>
+            
+            <div style="margin-top: 20px;">
+                <h4 style="color: #ddd;">OpenRank 趋势对比</h4>
+                <div id="compare-chart" class="compare-chart-box"></div>
             </div>
         </div>
     </div>
@@ -530,9 +582,90 @@
             });
         }
         
+        let compareChart;
+
+        function openCompareModal() {
+            document.getElementById('compareModal').style.display = "block";
+            // Init chart if needed
+            if (!compareChart) {
+                setTimeout(() => {
+                    compareChart = echarts.init(document.getElementById('compare-chart'));
+                }, 100);
+            }
+        }
+
+        function closeCompareModal() {
+            document.getElementById('compareModal').style.display = "none";
+        }
+
+        async function runComparison() {
+            const r1 = document.getElementById('comp-repo1').value;
+            const r2 = document.getElementById('comp-repo2').value;
+            if(!r1 || !r2) return;
+            
+            // Parse owner/repo
+            const p1 = r1.split('/');
+            const p2 = r2.split('/');
+            if(p1.length < 2 || p2.length < 2) {
+                alert("Please use format: owner/repo");
+                return;
+            }
+
+            try {
+                const res = await fetch(`/api/v1/compare/${p1[0]}/${p1[1]}/${p2[0]}/${p2[1]}`);
+                const data = await res.json();
+                
+                // Update Scores
+                const s1 = data.repo1.openrank[5] || 0;
+                const s2 = data.repo2.openrank[5] || 0;
+                document.getElementById('comp-score1').innerText = `Rank: ${s1.toFixed(1)}`;
+                document.getElementById('comp-score2').innerText = `Rank: ${s2.toFixed(1)}`;
+                
+                // Update Chart
+                const option = {
+                    tooltip: { trigger: 'axis' },
+                    legend: { data: [r1, r2], textStyle: { color: '#ccc' } },
+                    grid: { top: 40, bottom: 30, left: 50, right: 20 },
+                    xAxis: {
+                        type: 'category',
+                        data: ['M-5', 'M-4', 'M-3', 'M-2', 'M-1', 'Now'],
+                        axisLine: { lineStyle: { color: '#666' } }
+                    },
+                    yAxis: {
+                        type: 'value',
+                        splitLine: { lineStyle: { color: '#333' } },
+                        axisLine: { lineStyle: { color: '#666' } }
+                    },
+                    series: [
+                        {
+                            name: r1,
+                            type: 'line',
+                            data: data.repo1.openrank,
+                            smooth: true,
+                            lineStyle: { width: 3, color: '#1890ff' }
+                        },
+                        {
+                            name: r2,
+                            type: 'line',
+                            data: data.repo2.openrank,
+                            smooth: true,
+                            lineStyle: { width: 3, color: '#f5222d' }
+                        }
+                    ]
+                };
+                compareChart.setOption(option);
+                
+            } catch (e) {
+                alert("Comparison failed: " + e.message);
+            }
+        }
+
         window.onclick = function(event) {
             if (event.target == document.getElementById('leaderboardModal')) {
                 closeModal();
+            }
+            if (event.target == document.getElementById('compareModal')) {
+                closeCompareModal();
             }
         }
 
