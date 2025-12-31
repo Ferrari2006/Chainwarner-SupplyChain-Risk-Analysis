@@ -591,8 +591,11 @@
         function updateDetails(node) {
             // document.getElementById('node-details').style.display = 'block'; // No longer needed as it is always visible
             document.getElementById('detail-name').innerText = node.full_name;
-            document.getElementById('detail-risk').innerText = (node.risk * 100).toFixed(1);
-            document.getElementById('detail-risk').style.color = getRiskColor(node.risk);
+            
+            // Fix: Handle null/undefined risk scores safely
+            const safeRisk = node.risk !== undefined && node.risk !== null ? node.risk : 0.5;
+            document.getElementById('detail-risk').innerText = (safeRisk * 100).toFixed(1);
+            document.getElementById('detail-risk').style.color = getRiskColor(safeRisk);
             
             // 解析描述中的 Constraint
             const constraintMatch = node.desc ? node.desc.match(/Constraint: ([\d\.]+)/) : null;

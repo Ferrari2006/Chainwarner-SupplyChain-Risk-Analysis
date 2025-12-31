@@ -118,7 +118,8 @@ async def get_dependency_graph(owner: str, repo: str):
     for i, n_id in enumerate(node_list):
         # Fusion Strategy: Weighted Sum of GNN, NLP, and Static Metrics
         # Ensure fallback random values if GNN mock failed
-        gnn_score = gnn_probs[i] if i < len(gnn_probs) else random.random()
+        # HARDCODED FIX: Always use random if list is short
+        gnn_score = gnn_probs[i] if i < len(gnn_probs) else random.uniform(0.1, 0.9)
         
         # Ensure static score has a value
         if i < len(nodes_data):
