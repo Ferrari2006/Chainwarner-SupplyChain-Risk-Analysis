@@ -9,11 +9,12 @@ class NLPEngine:
         if self.sentiment_analyzer:
             return
         
-        print("Loading NLP Model... (This may take a while)")
+        # Use a tiny model to prevent OOM on Free Tier
+        print("Loading NLP Model... (Tiny)")
         try:
             self.sentiment_analyzer = pipeline(
                 "sentiment-analysis", 
-                model="distilbert-base-uncased-finetuned-sst-2-english",
+                model="distilbert/distilbert-base-uncased-finetuned-sst-2-english", 
                 top_k=None
             )
         except Exception as e:
