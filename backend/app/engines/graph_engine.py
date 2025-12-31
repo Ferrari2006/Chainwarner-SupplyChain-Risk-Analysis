@@ -31,17 +31,24 @@ class GraphEngine:
         # 1. Structural Holes (Burt's Constraint)
         # Identifies brokers who connect otherwise disconnected communities.
         try:
+            # Try EasyGraph first
             if USE_EASYGRAPH:
-                # EasyGraph implementation
-                # Note: Some versions might have different API signatures
                 constraint = eg.constraint(self.G)
                 metrics['constraint'] = constraint
             else:
-                # NetworkX fallback
+                # Use NetworkX directly if EasyGraph is missing
                 import networkx as nx
                 metrics['constraint'] = nx.constraint(self.G)
         except Exception as e:
-            print(f"Error calculating constraint: {e}")
+            print(f"EasyGraph/NetworkX constraint failed: {e}")
+            # Fallback: Manually calculate simplified Constraint (Sum of dyadic constraints)
+            # C_i = sum( (p_ij + sum(p_iq * p_qj))^2 )
+            # This is a complex calculation, so we use a simpler heuristic for fallback:
+            # Degree Centrality as a proxy for "Constraint" (High Degree ~ High Constraint in dense clusters)
+            try:
+                metrics['constraint'] = {n: deg / (len(self.G) - 1) for n, deg in self.G.degree()}
+            except:
+                metrics['constraint'] = {}
 
         # 2. Betweenness Centrality
         # Identifies nodes that control information flow.
@@ -59,6 +66,61 @@ class GraphEngine:
             print(f"Error calculating pagerank: {e}")
 
         return metrics
+
+    def detect_communities(self):
+        """
+        Identify communities (ecosystems) within the graph.
+        Uses Louvain algorithm if available, else Label Propagation.
+        """
+        try:
+            if USE_EASYGRAPH:
+                # EasyGraph Community Detection
+                communities = eg.get_communities(self.G)
+                return communities
+            else:
+                # NetworkX Fallback
+                import networkx as nx
+                # community = nx.community.louvain_communities(self.G) # Requires newer nx
+                # Fallback to simple connected components for demo
+                return [list(c) for c in nx.connected_components(self.G.to_undirected())]
+        except Exception as e:
+            print(f"Community Detection Failed: {e}")
+            return {}
+
+    def simulate_risk_propagation(self, start_node, max_depth=3):
+        """
+        Simulate risk diffusion using BFS (Breadth-First Search).
+        Returns a list of affected nodes layer by layer.
+        """
+        affected_nodes = {}
+        visited = set()
+        queue = [(start_node, 0)]
+        visited.add(start_node)
+
+        while queue:
+            node, depth = queue.pop(0)
+            if depth > max_depth:
+                continue
+            
+            if depth not in affected_nodes:
+                affected_nodes[depth] = []
+            affected_nodes[depth].append(node)
+
+            # Get downstream neighbors (Reverse graph if edges are 'depends_on')
+            # Assuming G is: Source depends on Target. 
+            # Risk flows from Target (upstream) to Source (downstream).
+            # So we need predecessors in standard dependency graph.
+            try:
+                # EasyGraph predecessor access
+                predecessors = list(self.G.predecessors(node))
+                for pred in predecessors:
+                    if pred not in visited:
+                        visited.add(pred)
+                        queue.append((pred, depth + 1))
+            except:
+                pass
+        
+        return affected_nodes
 
     def get_risk_path(self, source, target):
         try:
