@@ -180,27 +180,13 @@ async def get_dependency_graph(owner: str, repo: str):
                 dependencies = re.findall(r'([a-zA-Z0-9\-_]+)\s*=', toml_txt)
 
     # Fallback to Mock ONLY if real fetch failed completely
+    # DELETED MOCK: We now require real data for Render deployment
     if not dependencies:
-        # Real Dataset Mapping (Pre-calculated structure for demo)
-        REAL_DATASETS = {
-            "facebook/react": [
-                "object-assign", "prop-types", "scheduler", "loose-envify", "react-is"
-            ],
-            "tensorflow/tensorflow": [
-                "absl-py", "astunparse", "flatbuffers", "gast", "google-pasta", "grpcio", "h5py", "keras", "numpy", "opt-einsum", "packaging", "protobuf", "six", "termcolor", "typing-extensions", "wrapt"
-            ],
-            "pytorch/pytorch": [
-                "typing-extensions", "sympy", "networkx", "jinja2", "fsspec", "filelock"
-            ]
-        }
-        if repo_full_name in REAL_DATASETS:
-            dependencies = REAL_DATASETS[repo_full_name]
-        else:
-            dependencies = [
-                "tensorflow", "pytorch", "keras", 
-                "pandas", "numpy", "scikit-learn",
-                "spark", "transformers"
-            ]
+        print(f"[Warning] Failed to fetch dependencies for {repo_full_name}. Graph will be empty.")
+        # Return empty but valid graph structure to avoid frontend crash
+        # This forces the user to see that data is missing, rather than seeing fake data.
+        nodes_data[0]['description'] += " | Error: No deps found"
+        # We can try to fetch a default list if it's a known big repo, but let's stick to "No Mock" policy.
     
     # Limit graph size for performance
     dependencies = dependencies[:20] 

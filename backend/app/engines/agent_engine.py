@@ -19,8 +19,8 @@ class AgentEngine:
     
     def __init__(self):
         # Configuration
-        # Hardcoded for contest demo (In production, use env vars)
-        self.api_key = "sk-e79eaeeff68e4fccb1dedd10b8d9c407"
+        # Secure: Read from environment variable
+        self.api_key = os.getenv("LLM_API_KEY")
         self.api_base = os.getenv("LLM_API_BASE", "https://api.deepseek.com") # Default to DeepSeek
         self.model = os.getenv("LLM_MODEL", "deepseek-chat")
         
