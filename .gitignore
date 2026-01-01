@@ -40,3 +40,6 @@ Thumbs.db
 
 # Database
 *.db
+
+# Cache
+analysis_cache.json

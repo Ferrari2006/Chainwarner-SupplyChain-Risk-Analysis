@@ -11,6 +11,7 @@ import asyncio
 import httpx
 import json
 import re
+import os
 from typing import List, Dict, Any
 from pydantic import BaseModel
 
@@ -27,8 +28,33 @@ ml_engine = MLEngine()
 nlp_engine = NLPEngine()
 agent_engine = AgentEngine()
 
-# In-Memory Cache
+# In-Memory Cache (Persisted to JSON on write)
 ANALYSIS_CACHE = {}
+CACHE_FILE = "analysis_cache.json"
+
+# Load cache from disk on startup
+try:
+    if os.path.exists(CACHE_FILE):
+        with open(CACHE_FILE, 'r') as f:
+            # Need to reconstruct GraphData objects from dict
+            raw_cache = json.load(f)
+            for k, v in raw_cache.items():
+                # Reconstruct Node and Edge objects
+                nodes = [Node(**n) for n in v['nodes']]
+                edges = [Edge(**e) for e in v['edges']]
+                ANALYSIS_CACHE[k] = GraphData(nodes=nodes, edges=edges)
+            print(f"Loaded {len(ANALYSIS_CACHE)} items from cache.")
+except Exception as e:
+    print(f"Failed to load cache: {e}")
+
+def save_cache():
+    try:
+        # Convert Pydantic models to dicts for JSON serialization
+        serializable_cache = {k: v.dict() for k, v in ANALYSIS_CACHE.items()}
+        with open(CACHE_FILE, 'w') as f:
+            json.dump(serializable_cache, f)
+    except Exception as e:
+        print(f"Failed to save cache: {e}")
 
 # Fallback Risks for demo if network fails
 PREDEFINED_RISKS = {
@@ -79,6 +105,10 @@ def parse_dependencies(content: str, fmt: str) -> List[str]:
 PACKAGE_MAP = {
     "react": "facebook/react",
     "react-dom": "facebook/react",
+    "scheduler": "facebook/react", # Monorepo
+    "prop-types": "facebook/prop-types",
+    "loose-envify": "manfredsteyer/ngx-build-plus", # Approximation or use a known mirror
+    "object-assign": "sindresorhus/object-assign",
     "vue": "vuejs/vue",
     "next": "vercel/next.js",
     "fastapi": "tiangolo/fastapi",
@@ -283,12 +313,15 @@ async def get_dependency_graph(owner: str, repo: str):
             # High Rank/Activity -> Low Risk
             dep_risk = 1.0 - (norm_rank * 0.6 + norm_act * 0.4)
             dep_risk = max(0.05, min(0.95, dep_risk))
+            desc_text = f"Rank: {dep_openrank:.1f} | Risk: {dep_risk * 100:.1f}"
         else:
-            # If no data found in OpenDigger, it's either very new or internal.
-            # Mark as slightly higher risk (unknown)
-            dep_risk = 0.6 
+            # If no data found in OpenDigger
+            # STRICTLY NO RANDOMNESS per user request
+            # Mark as -1 to indicate "Unknown" status explicitly
+            dep_risk = -1.0
+            desc_text = "Data Unavailable (OpenDigger Missing)"
 
-        nodes_data.append({"id": dep, "risk_score": dep_risk, "type": "Lib", "description": f"Rank: {dep_openrank:.1f} | Risk: {dep_risk * 100:.1f}"})
+        nodes_data.append({"id": dep, "risk_score": dep_risk, "type": "Lib", "description": desc_text})
         edges_data.append({"source": repo_full_name, "target": dep})
         
     # Load into Graph Engine
@@ -324,40 +357,50 @@ async def get_dependency_graph(owner: str, repo: str):
         node_obj = next((x for x in nodes_data if x['id'] == n_id), None)
         base_risk = node_obj['risk_score'] if node_obj else 0.5
         
-        # 2. Topology Metrics (From EasyGraph)
-        constraint_val = eg_metrics.get('constraint', {}).get(n_id, 0)
-        # Normalize constraint (usually 0-1, but can be higher)
-        score_constraint = min(1.0, constraint_val)
-        
-        betweenness_val = eg_metrics.get('betweenness', {}).get(n_id, 0)
-        # Normalize betweenness (usually small)
-        score_centrality = min(1.0, betweenness_val * 5.0) # Boost for visibility
+        # If base_risk is -1 (Unknown), we keep it as -1 to signal frontend
+        if base_risk == -1.0:
+            final_risk = -1.0
+            desc_text = node_obj['description'] if node_obj else "Unknown"
+        else:
+            # 2. Topology Metrics (From EasyGraph)
+            constraint_val = eg_metrics.get('constraint', {}).get(n_id, 0)
+            # Normalize constraint (usually 0-1, but can be higher)
+            score_constraint = min(1.0, constraint_val)
+            
+            betweenness_val = eg_metrics.get('betweenness', {}).get(n_id, 0)
+            # Normalize betweenness (usually small)
+            score_centrality = min(1.0, betweenness_val * 5.0) # Boost for visibility
 
-        # 3. Weighted Fusion Model
-        # Fusion: 70% Base Risk (Data Driven) + 30% Topology (Graph Driven)
-        final_risk = (base_risk * 0.7) + (score_constraint * 0.2) + (score_centrality * 0.1)
-        
-        final_risk = min(1.0, max(0.05, final_risk))
+            # 3. Weighted Fusion Model
+            # Fusion: 70% Base Risk (Data Driven) + 30% Topology (Graph Driven)
+            final_risk = (base_risk * 0.7) + (score_constraint * 0.2) + (score_centrality * 0.1)
+            
+            final_risk = min(1.0, max(0.05, final_risk))
+            desc_text = f"Constraint: {constraint_val:.2f} | Risk: {final_risk * 100:.1f}"
         
         # Generate History (Simple fluctuation around the real risk)
         history = []
-        current = final_risk
-        # DETERMINISTIC History (Re-introduced for UI stability, but based on real risk)
-        # Use zlib hash of name to seed the fluctuation pattern
-        h_seed = deterministic_hash(n_id)
-        for k in range(6):
-            history.insert(0, float(f"{current * 100:.1f}"))
-            # Pseudo-random fluctuation
-            fluctuation = ((h_seed + k) % 100 - 50) / 1000.0 # -0.05 to +0.05
-            current = current + fluctuation
-            current = min(1.0, max(0.0, current))
+        # If unknown, history is flat zero
+        if final_risk == -1.0:
+            history = [0] * 6
+        else:
+            current = final_risk
+            # DETERMINISTIC History (Re-introduced for UI stability, but based on real risk)
+            # Use zlib hash of name to seed the fluctuation pattern
+            h_seed = deterministic_hash(n_id)
+            for k in range(6):
+                history.insert(0, float(f"{current * 100:.1f}"))
+                # Pseudo-random fluctuation
+                fluctuation = ((h_seed + k) % 100 - 50) / 1000.0 # -0.05 to +0.05
+                current = current + fluctuation
+                current = min(1.0, max(0.0, current))
 
         final_nodes.append(Node(
             id=n_id,
             label="Project" if n_id == repo_full_name else "Lib", 
             name=n_id,
             risk_score=final_risk,
-            description=f"Constraint: {constraint_val:.2f} | Risk: {final_risk * 100:.1f}",
+            description=desc_text,
             history=history
         ))
 
@@ -367,6 +410,8 @@ async def get_dependency_graph(owner: str, repo: str):
     
     # Update Cache
     ANALYSIS_CACHE[repo_full_name] = result
+    # Persist immediately
+    save_cache()
     
     return result
 
