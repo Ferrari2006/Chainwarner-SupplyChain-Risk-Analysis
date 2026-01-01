@@ -255,7 +255,7 @@ async def get_dependency_graph(owner: str, repo: str):
             # Mark as slightly higher risk (unknown)
             dep_risk = 0.6 
 
-        nodes_data.append({"id": dep, "risk_score": dep_risk, "type": "Lib", "description": f"Rank: {dep_openrank:.1f}"})
+        nodes_data.append({"id": dep, "risk_score": dep_risk, "type": "Lib", "description": f"Rank: {dep_openrank:.1f} | Risk: {dep_risk * 100:.1f}"})
         edges_data.append({"source": repo_full_name, "target": dep})
         
     # Load into Graph Engine
@@ -323,7 +323,7 @@ async def get_dependency_graph(owner: str, repo: str):
             label="Project" if n_id == repo_full_name else "Lib", 
             name=n_id,
             risk_score=final_risk,
-            description=f"Constraint: {constraint_val:.2f} | Risk: {final_risk:.2f}",
+            description=f"Constraint: {constraint_val:.2f} | Risk: {final_risk * 100:.1f}",
             history=history
         ))
 
@@ -384,55 +384,76 @@ async def get_leaderboard():
         {"rank": 15, "name": "ant-design/ant-design", "risk": 36.8, "reason": "Consistent Quality"}
     ]
 
+    # Dynamic Leaderboard Update Logic
+    # 1. Merge Predefined + Cached Items
+    
+    # Create Maps for fast lookup and update (handling hardcoded duplicates)
+    critical_map = {item['name']: item for item in critical_list}
+    stars_map = {item['name']: item for item in stars_list}
+    
     for repo_name, graph_data in recent_items: 
-        # Iterate through ALL nodes in the graph (Root + Dependencies)
         for node in graph_data.nodes:
-            # Inject High Risk into Critical List
-            if node.risk_score > 0.6: # High threshold for dependencies
-                if not any(item['name'] == node.id for item in critical_list):
-                    critical_list.append({
+            node_risk_percent = round(node.risk_score * 100, 1)
+            
+            # Update existing entries if present (Dynamic Override)
+            if node.id in critical_map:
+                critical_map[node.id]['risk'] = node_risk_percent
+                critical_map[node.id]['reason'] = "Updated Analysis"
+            
+            if node.id in stars_map:
+                stars_map[node.id]['risk'] = node_risk_percent
+                stars_map[node.id]['reason'] = "Updated Analysis"
+
+            # Logic for Critical List (High Risk)
+            # Threshold: Must be higher than the lowest risk in current Top 15
+            current_critical_values = [x['risk'] for x in critical_map.values()]
+            min_critical_risk = min(current_critical_values) if len(current_critical_values) >= 15 else 0
+            
+            if node_risk_percent > 60.0 and node.id not in critical_map: 
+                # Only add if it qualifies or list is not full
+                if len(critical_map) < 15 or node_risk_percent > min_critical_risk:
+                     critical_map[node.id] = {
                         "rank": 99, 
                         "name": node.id,
-                        "risk": round(node.risk_score * 100, 1),
+                        "risk": node_risk_percent,
                         "reason": "Dep Risk Detected" if node.id != repo_name else "Analyzed Project"
-                    })
+                    }
             
-            # Inject Low Risk into Stars List
-            elif node.risk_score <= 0.4: 
-                 if not any(item['name'] == node.id for item in stars_list):
-                    stars_list.append({
+            # Logic for Stars List (Low Risk)
+            # Threshold: Must be lower than the highest risk in current Top 15
+            current_star_values = [x['risk'] for x in stars_map.values()]
+            max_star_risk = max(current_star_values) if len(current_star_values) >= 15 else 100
+            
+            if node_risk_percent <= 40.0 and node.id not in stars_map: 
+                 # Only add if it qualifies or list is not full
+                 if len(stars_map) < 15 or node_risk_percent < max_star_risk:
+                    stars_map[node.id] = {
                         "rank": 99,
                         "name": node.id,
-                        "risk": round(node.risk_score * 100, 1),
+                        "risk": node_risk_percent,
                         "reason": "Safe Dependency" if node.id != repo_name else "Safe Architecture"
-                    })
+                    }
 
-    # Inject Low Risk Cache into Stars List
-    for repo_name, graph_data in recent_items:
-        root = next((n for n in graph_data.nodes if n.id == repo_name), None)
-        # Fix: Check for Low Risk (e.g. <= 0.4)
-        if root and root.risk_score <= 0.4: 
-             if not any(item['name'] == repo_name for item in stars_list):
-                stars_list.append({
-                    "rank": 99,
-                    "name": repo_name,
-                    "risk": round(root.risk_score * 100, 1),
-                    "reason": "Safe Architecture"
-                })
+    # 2. Convert back to lists
+    all_critical = list(critical_map.values())
+    all_stars = list(stars_map.values())
 
-    # Re-sort and slice Critical
-    critical_list.sort(key=lambda x: x['risk'], reverse=True)
+    # 3. Sort and Slice
+    # Critical: Descending (Higher is worse)
+    all_critical.sort(key=lambda x: x['risk'], reverse=True)
+    critical_list = all_critical[:15]
     for i, item in enumerate(critical_list):
         item['rank'] = i + 1
 
-    # Re-sort and slice Stars (Ascending Risk)
-    stars_list.sort(key=lambda x: x['risk'], reverse=False)
+    # Stars: Ascending (Lower is better)
+    all_stars.sort(key=lambda x: x['risk'], reverse=False)
+    stars_list = all_stars[:15]
     for i, item in enumerate(stars_list):
         item['rank'] = i + 1
     
     return {
-        "critical": critical_list[:15],
-        "stars": stars_list[:15],
+        "critical": critical_list,
+        "stars": stars_list,
         "alerts": [
             "🚨 [Critical] New RCE vulnerability detected in 'fastjson' (CVE-2025-XXXX).",
             "⚠️ [Warning] 'colors.js' maintainer account suspicious activity detected.",
