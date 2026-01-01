@@ -447,7 +447,12 @@ async def chat_with_agent(req: ChatRequest):
     context_dict = context_data.dict()
     
     # 3. Process Query
-    answer = agent_engine.process_query(req.query, context_dict)
+    # Ensure we await the async method
+    try:
+        answer = await agent_engine.process_query(req.query, context_dict)
+    except Exception as e:
+        print(f"Agent Error: {e}")
+        answer = "Sorry, I encountered an error while processing your request."
     
     return {"response": answer}
 

@@ -19,24 +19,25 @@ class AgentEngine:
     
     def __init__(self):
         # Configuration
-        self.api_key = os.getenv("LLM_API_KEY")
-        self.api_base = os.getenv("LLM_API_BASE", "https://api.deepseek.com/v1") # Default to DeepSeek
+        # Hardcoded for contest demo (In production, use env vars)
+        self.api_key = "sk-e79eaeeff68e4fccb1dedd10b8d9c407"
+        self.api_base = os.getenv("LLM_API_BASE", "https://api.deepseek.com") # Default to DeepSeek
         self.model = os.getenv("LLM_MODEL", "deepseek-chat")
         
-        # Professional Templates for Heuristic Mode
+        # Professional Templates for Heuristic Mode (Chinese)
         self.templates = {
             "RISK_ANALYSIS": [
-                "Based on the multi-dimensional analysis, **{repo_name}** has a risk score of **{risk_percent}/100** ({status}). This is primarily driven by its {driver_factor}.",
-                "The system calculates a risk index of **{risk_percent}** for **{repo_name}**. The {status} status suggests {implication}.",
-                "Deep dependency scanning reveals a risk level of **{risk_percent}%**. The main contributors are {driver_factor} and structural topology."
+                "根据多维深度分析，**{repo_name}** 的风险评分为 **{risk_percent}/100** ({status})。这主要是由其{driver_factor}决定的。",
+                "系统计算出 **{repo_name}** 的风险指数为 **{risk_percent}**。{status} 状态表明{implication}。",
+                "深度依赖扫描显示风险水平为 **{risk_percent}%**。主要贡献因素包括{driver_factor}和拓扑结构脆弱性。"
             ],
             "ECOSYSTEM_INSIGHT": [
-                "OpenRank analysis shows this project has an influence score of **{openrank_val}**. It is a {rank_desc} player in the open source ecosystem.",
-                "With an OpenRank of **{openrank_val}**, **{repo_name}** demonstrates {rank_desc} community impact. Activity levels are {activity_desc}.",
+                "OpenRank 分析显示该项目的影响力得分为 **{openrank_val}**。它是开源生态中的{rank_desc}玩家。",
+                "凭借 **{openrank_val}** 的 OpenRank，**{repo_name}** 展现了{rank_desc}社区影响力。活跃度水平{activity_desc}。",
             ],
             "SECURITY_ADVICE": [
-                "💡 **Action Item**: Given the {risk_level} risk, we recommend {action}. specifically focusing on {focus_area}.",
-                "🛡️ **Mitigation Strategy**: {action}. The graph structure indicates high centrality in {focus_area}.",
+                "💡 **行动建议**: 鉴于 {risk_level} 风险，我们建议{action}。特别关注{focus_area}。",
+                "🛡️ **缓解策略**: {action}。图结构表明在{focus_area}存在高中介中心性节点。",
             ]
         }
 
@@ -46,7 +47,9 @@ class AgentEngine:
         """
         if self.api_key:
             try:
-                return await self.call_llm(query, context)
+                # IMPORTANT: Ensure call_llm is awaited properly
+                result = await self.call_llm(query, context)
+                return result
             except Exception as e:
                 print(f"[Agent] LLM Call Failed: {e}. Falling back to Template Engine.")
         
@@ -63,18 +66,19 @@ class AgentEngine:
         description = root_node.get('description', '')
         
         system_prompt = f"""
-        You are ChainWarner AI, an expert in software supply chain security and open source ecosystem analysis.
+        你是一个名为 ChainWarner AI 的专家，专注于软件供应链安全和开源生态分析。
         
-        Current Project Context:
-        - Name: {repo_name}
-        - Risk Score: {risk_score:.2f} (0=Safe, 1=Dangerous)
-        - Metrics: {description}
-        - Dependency Count: {len(context['nodes']) - 1}
+        当前项目上下文:
+        - 项目名称: {repo_name}
+        - 风险评分: {risk_score:.2f} (0=安全, 1=危险)
+        - 关键指标: {description}
+        - 依赖数量: {len(context['nodes']) - 1}
         
-        Instructions:
-        - Answer the user's query based on the context.
-        - Be professional, concise, and insightful.
-        - Use bolding for key metrics.
+        指令:
+        - 请根据上述上下文回答用户的提问。
+        - 回答必须使用**中文**。
+        - 保持专业、简洁且有洞察力。
+        - 关键指标数值请使用加粗显示。
         """
         
         async with httpx.AsyncClient() as client:
@@ -102,14 +106,14 @@ class AgentEngine:
         
         # Extract Variables
         root = context['nodes'][0] if context['nodes'] else {}
-        repo_name = root.get('name', 'Unknown')
+        repo_name = root.get('name', '未知项目')
         risk = root.get('risk_score', 0.5)
         percent = round(risk * 100, 1)
         
         # Parse Description for hidden metrics (OpenRank/Constraint)
         desc = root.get('description', '') # "Constraint: 0.12 | Rank: 0.85"
-        openrank_val = "Unknown"
-        constraint_val = "Unknown"
+        openrank_val = "未知"
+        constraint_val = "未知"
         
         if "Rank:" in desc:
             try:
@@ -119,55 +123,56 @@ class AgentEngine:
             except:
                 pass
                 
-        # Determine Status
+        # Determine Status (Chinese)
         if risk < 0.4:
-            status = "Safe ✅"
-            risk_level = "low"
-            implication = "stable development practices"
-            driver_factor = "high OpenRank and consistent activity"
-            rank_desc = "dominant"
-            activity_desc = "robust"
-            action = "maintaining current audit schedules"
-            focus_area = "transitive dependencies"
+            status = "安全 ✅"
+            risk_level = "低"
+            implication = "开发实践稳定"
+            driver_factor = "高 OpenRank 和持续的活跃度"
+            rank_desc = "主导型"
+            activity_desc = "强劲"
+            action = "保持当前的审计计划"
+            focus_area = "传递性依赖"
         elif risk < 0.7:
-            status = "Caution ⚠️"
-            risk_level = "moderate"
-            implication = "potential structural weaknesses"
-            driver_factor = "complex dependency chains"
-            rank_desc = "growing"
-            activity_desc = "fluctuating"
-            action = "locking dependency versions"
-            focus_area = "direct dependencies"
+            status = "警告 ⚠️"
+            risk_level = "中等"
+            implication = "潜在的结构性弱点"
+            driver_factor = "复杂的依赖链"
+            rank_desc = "成长型"
+            activity_desc = "波动"
+            action = "锁定依赖版本"
+            focus_area = "直接依赖"
         else:
-            status = "Critical 🚨"
-            risk_level = "high"
-            implication = "urgent security attention needed"
-            driver_factor = "high structural constraint and low activity"
-            rank_desc = "niche"
-            activity_desc = "stagnant"
-            action = "immediate manual code review"
-            focus_area = "security patches"
+            status = "高危 🚨"
+            risk_level = "高"
+            implication = "急需安全关注"
+            driver_factor = "高结构洞约束和低活跃度"
+            rank_desc = "小众/边缘"
+            activity_desc = "停滞"
+            action = "立即进行人工代码审查"
+            focus_area = "安全补丁"
 
         # Intent Routing
-        if any(w in query for w in ["risk", "score", "safe", "status"]):
+        # Use simple keyword matching for Chinese/English
+        if any(w in query for w in ["risk", "score", "safe", "status", "风险", "安全", "分数"]):
             tpl = random.choice(self.templates["RISK_ANALYSIS"])
             return tpl.format(
                 repo_name=repo_name, risk_percent=percent, status=status,
                 driver_factor=driver_factor, implication=implication
             )
             
-        elif any(w in query for w in ["rank", "influence", "community", "trend"]):
+        elif any(w in query for w in ["rank", "influence", "community", "trend", "排名", "影响", "社区", "趋势"]):
             tpl = random.choice(self.templates["ECOSYSTEM_INSIGHT"])
             return tpl.format(
                 repo_name=repo_name, openrank_val=openrank_val,
                 rank_desc=rank_desc, activity_desc=activity_desc
             )
             
-        elif any(w in query for w in ["fix", "advice", "suggestion", "help"]):
+        elif any(w in query for w in ["fix", "advice", "suggestion", "help", "建议", "修复", "怎么办"]):
             tpl = random.choice(self.templates["SECURITY_ADVICE"])
             return tpl.format(
                 risk_level=risk_level, action=action, focus_area=focus_area
             )
             
         # Default General Response
-        return f"I've analyzed **{repo_name}**. It has a risk score of **{percent}** and OpenRank of **{openrank_val}**. How can I help further?"
+        return f"我已经分析了 **{repo_name}**。它的风险评分为 **{percent}**，OpenRank 为 **{openrank_val}**。有什么我可以进一步帮助您的吗？"

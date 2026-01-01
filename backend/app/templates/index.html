@@ -696,12 +696,13 @@
             const query = input.value.trim();
             if (!query) return;
 
-            // Add User Message
+            // 1. 立即显示用户消息
             addChatMsg(query, 'user');
             input.value = '';
 
-            // Loading
+            // 2. 显示 Loading 状态
             const loadingId = addChatMsg("思考中...", 'bot');
+            const loadingElem = document.getElementById(loadingId);
 
             try {
                 // Get current repo context
@@ -715,14 +716,21 @@
                 
                 const data = await res.json();
                 
-                // Remove loading
-                document.getElementById(loadingId).remove();
+                // 3. 移除 Loading 消息
+                if (loadingElem) {
+                    loadingElem.remove();
+                }
                 
-                // Add Bot Response
+                // 4. 显示 Bot 回复
                 addChatMsg(data.response, 'bot');
                 
             } catch (e) {
-                document.getElementById(loadingId).innerText = "Error: 无法连接到智能体。";
+                // 错误处理：移除 Loading 并显示错误
+                if (loadingElem) {
+                    loadingElem.remove();
+                }
+                addChatMsg("Error: 无法连接到智能体，请稍后再试。", 'bot');
+                console.error(e);
             }
         }
 
