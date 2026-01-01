@@ -7,6 +7,104 @@ from app.engines.agent_engine import AgentEngine
 from app.core.stream_processor import stream_processor
 import zlib
 import math
+import asyncio
+import httpx
+import json
+import re
+from typing import List, Dict, Any
+from pydantic import BaseModel
+
+router = APIRouter()
+
+class ChatRequest(BaseModel):
+    query: str
+    context_repo: str
+
+# Global Engines
+
+graph_engine = GraphEngine()
+ml_engine = MLEngine() 
+nlp_engine = NLPEngine()
+agent_engine = AgentEngine()
+
+# In-Memory Cache
+ANALYSIS_CACHE = {}
+
+# Fallback Risks for demo if network fails
+PREDEFINED_RISKS = {
+    "log4j": 95,
+    "fastjson": 90, 
+    "struts2": 85,
+    "openssl": 80
+}
+
+async def fetch_repo_file(owner: str, repo: str, path: str) -> str:
+    """Fetch raw file content from GitHub (via jsDelivr CDN for reliability)."""
+    # Try main branch first, then master
+    # Use jsDelivr to bypass raw.githubusercontent.com DNS pollution
+    for branch in ["main", "master"]:
+        # url = f"https://raw.githubusercontent.com/{owner}/{repo}/{branch}/{path}"
+        url = f"https://cdn.jsdelivr.net/gh/{owner}/{repo}@{branch}/{path}"
+        try:
+            async with httpx.AsyncClient() as client:
+                resp = await client.get(url, timeout=5.0)
+                if resp.status_code == 200:
+                    return resp.text
+        except:
+            pass
+    return None
+
+def parse_dependencies(content: str, fmt: str) -> List[str]:
+    """Extract dependency names from package files."""
+    deps = []
+    if fmt == 'json':
+        try:
+            data = json.loads(content)
+            deps.extend(list(data.get('dependencies', {}).keys()))
+            deps.extend(list(data.get('devDependencies', {}).keys())) # Include dev deps for richer graph
+            deps.extend(list(data.get('peerDependencies', {}).keys()))
+        except:
+            pass
+    elif fmt == 'txt':
+        for line in content.splitlines():
+            line = line.strip()
+            if line and not line.startswith('#'):
+                # Extract name from "package==1.0.0" or "package>=1.0"
+                name = re.split(r'[=<>~!]', line)[0].strip()
+                if name:
+                    deps.append(name)
+    return deps
+
+# Common Package to Repo Mapping (Heuristic for Demo)
+PACKAGE_MAP = {
+    "react": "facebook/react",
+    "react-dom": "facebook/react",
+    "vue": "vuejs/vue",
+    "next": "vercel/next.js",
+    "fastapi": "tiangolo/fastapi",
+    "uvicorn": "encode/uvicorn",
+    "pydantic": "pydantic/pydantic",
+    "sqlalchemy": "sqlalchemy/sqlalchemy",
+    "requests": "psf/requests",
+    "numpy": "numpy/numpy",
+    "pandas": "pandas-dev/pandas",
+    "tensorflow": "tensorflow/tensorflow",
+    "pytorch": "pytorch/pytorch",
+    "flask": "pallets/flask",
+    "django": "django/django",
+    "express": "expressjs/express",
+    "lodash": "lodash/lodash",
+    "axios": "axios/axios",
+    "moment": "moment/moment",
+    "three": "mrdoob/three.js",
+    "antd": "ant-design/ant-design"
+}
+
+def resolve_repo_name(pkg_name: str) -> str:
+    """Try to map a package name to a GitHub repo owner/name."""
+    if "/" in pkg_name:
+        return pkg_name # Already has owner
+    return PACKAGE_MAP.get(pkg_name.lower(), f"{pkg_name}/{pkg_name}")
 
 # Helper for deterministic hash
 def deterministic_hash(s: str) -> int:
@@ -48,7 +146,7 @@ async def get_dependency_graph(owner: str, repo: str):
     edges_data = []
     
     # Root Node
-    nodes_data.append({"id": repo_full_name, "risk_score": base_score, "type": "Target"})
+    nodes_data.append({"id": repo_full_name, "risk_score": base_score, "type": "Target", "description": "Target Project"})
     
     # 100% Real Dependency Fetching
     dependencies = []
@@ -70,140 +168,162 @@ async def get_dependency_graph(owner: str, repo: str):
                 import re
                 dependencies = re.findall(r'([a-zA-Z0-9\-_]+)\s*=', toml_txt)
 
-    # Fallback to Mock ONLY if real fetch failed completely
-    # DELETED MOCK: We now require real data for Render deployment
     if not dependencies:
         print(f"[Warning] Failed to fetch dependencies for {repo_full_name}. Graph will be empty.")
-        # Return empty but valid graph structure to avoid frontend crash
-        # This forces the user to see that data is missing, rather than seeing fake data.
         nodes_data[0]['description'] += " | Error: No deps found"
-        # We can try to fetch a default list if it's a known big repo, but let's stick to "No Mock" policy.
     
-    # Limit graph size for performance
-    dependencies = dependencies[:20] 
+    # Limit graph size for performance (but fetch real data for these)
+    # INCREASED: 15 -> 50 for better demo
+    dependencies = dependencies[:50] 
     
+    # Real Data Fetching for Dependencies
+    dep_metrics = {}
+    
+    async def fetch_dep_metrics(dep_name):
+        mapped_name = resolve_repo_name(dep_name)
+        # Fetch both metrics in parallel for this dependency
+        # IMPORTANT: Use return_exceptions=True to prevent one failure from killing all
+        d_act, d_rank = await asyncio.gather(
+            stream_processor.fetch_and_store(mapped_name, "activity"),
+            stream_processor.fetch_and_store(mapped_name, "openrank"),
+            return_exceptions=True
+        )
+        # Handle exceptions/None
+        if isinstance(d_act, Exception) or not d_act: 
+            # print(f"Failed activity for {mapped_name}: {d_act}")
+            d_act = None
+        if isinstance(d_rank, Exception) or not d_rank: 
+            # print(f"Failed openrank for {mapped_name}: {d_rank}")
+            d_rank = None
+            
+        return dep_name, mapped_name, d_act, d_rank
+
+    # Spawn tasks for all dependencies
+    # FIX: Ensure we actually wait for them
+    if dependencies:
+        fetch_tasks = [fetch_dep_metrics(d) for d in dependencies]
+        results = await asyncio.gather(*fetch_tasks)
+        for dep_name, mapped_name, d_act, d_rank in results:
+            dep_metrics[dep_name] = {
+                "mapped_name": mapped_name,
+                "activity": d_act,
+                "openrank": d_rank
+            }
+
     # Create topology
     for dep in dependencies:
-        # Assign semi-realistic risk based on name length (just for variance)
-        # DETERMINISTIC: Use zlib.adler32 instead of hash()
-        h_val = deterministic_hash(dep)
-        risk_val = (h_val % 100) / 100.0 
-        nodes_data.append({"id": dep, "risk_score": risk_val, "type": "Lib"})
+        metrics = dep_metrics.get(dep)
+        
+        # Calculate Risk based on REAL metrics
+        # Default neutral risk if no data found
+        dep_risk = 0.5 
+        dep_openrank = 0
+        dep_activity = 0
+        
+        if metrics and (metrics['activity'] or metrics['openrank']):
+            # Calculate score similarly to root node
+            max_rank = 1000.0
+            max_act = 50.0
+            
+            # OpenDigger returns dict { "2023-01": 12.3, ... }
+            # We need to get the latest value safely
+            curr_rank = 0
+            if metrics['openrank'] and isinstance(metrics['openrank'], dict):
+                 try:
+                     curr_rank = list(metrics['openrank'].values())[-1]
+                 except: pass
+            
+            curr_act = 0
+            if metrics['activity'] and isinstance(metrics['activity'], dict):
+                try:
+                    curr_act = list(metrics['activity'].values())[-1]
+                except: pass
+            
+            dep_openrank = curr_rank
+            dep_activity = curr_act
+            
+            norm_rank = min(1.0, curr_rank / max_rank)
+            norm_act = min(1.0, curr_act / max_act)
+            
+            # Risk is inverse of health
+            # 60% weight on Rank, 40% on Activity
+            # High Rank/Activity -> Low Risk
+            dep_risk = 1.0 - (norm_rank * 0.6 + norm_act * 0.4)
+            dep_risk = max(0.05, min(0.95, dep_risk))
+        else:
+            # If no data found in OpenDigger, it's either very new or internal.
+            # Mark as slightly higher risk (unknown)
+            dep_risk = 0.6 
+
+        nodes_data.append({"id": dep, "risk_score": dep_risk, "type": "Lib", "description": f"Rank: {dep_openrank:.1f}"})
         edges_data.append({"source": repo_full_name, "target": dep})
         
-        # Add Transitive Dependencies (2nd Hop) - Reduced probability for cleaner graph
-        if h_val % 3 == 0: 
-            sub_dep = f"{dep}-core"
-            # DETERMINISTIC risk for sub-dep
-            sub_risk = (deterministic_hash(sub_dep) % 100) / 100.0
-            nodes_data.append({"id": sub_dep, "risk_score": sub_risk, "type": "Plugin"})
-            edges_data.append({"source": dep, "target": sub_dep})
-
     # Load into Graph Engine
-    graph_engine.build_graph(nodes_data, edges_data)
-    
-    # --- 3. Advanced Algorithm Phase (EasyGraph) ---
-    eg_metrics = graph_engine.calculate_metrics()
-    
+    # IMPORTANT: Must build graph BEFORE calculating metrics
+    if len(nodes_data) > 1:
+        graph_engine.build_graph(nodes_data, edges_data)
+        
+        # --- 3. Advanced Algorithm Phase (EasyGraph) ---
+        eg_metrics = graph_engine.calculate_metrics()
+    else:
+        # Single node graph - metrics are trivial
+        eg_metrics = {'constraint': {}, 'betweenness': {}}
+
     # Mock Constraint if missing (EasyGraph sometimes fails on very small/disconnected graphs)
     if 'constraint' not in eg_metrics or not eg_metrics['constraint']:
-        # DETERMINISTIC: Use deterministic_random seeded by node id
-        eg_metrics['constraint'] = {n['id']: deterministic_random(n['id'] + "_constraint") for n in nodes_data}
+        # Fallback to degree-based heuristic if calculation fails
+        eg_metrics['constraint'] = {n['id']: 0.1 for n in nodes_data}
     
     # --- 4. AI Prediction Phase (PyTorch GNN) ---
-    # Prepare features for GNN: [Risk, InDegree, OutDegree, Constraint, Betweenness, PageRank]
-    # NOTE: To prevent OOM on Render Free Tier (512MB RAM), we use MOCK PREDICTION here.
-    # In a real high-memory env, uncomment the GNN lines.
-    
-    node_list = list(graph_engine.G.nodes) # <--- Ensure this is uncommented
-    # ... (GNN Logic skipped for stability) ...
-    
-    # DETERMINISTIC GNN Probs
-    gnn_probs = [deterministic_random(n + "_gnn") for n in node_list] # Deterministic Mock GNN
+    # node_list = list(graph_engine.G.nodes) 
+    # Use nodes_data directly to ensure order and existence
+    node_list = [n['id'] for n in nodes_data]
 
-    # --- 5. NLP Analysis Phase ---
-    # Mock commit messages
-    # nlp_risk = nlp_engine.analyze_text_risk(mock_commits) # Skipped for stability
-    nlp_risk = deterministic_random(repo_full_name + "_nlp") * 0.8 # Deterministic Mock NLP
-
+    # ... (GNN Logic skipped) ...
+    
     # --- 6. Fusion & Response Construction ---
     final_nodes = []
     
-    # Pre-calculate Max Values for Normalization
-    max_openrank = 1000.0
-    if openrank:
-        max_openrank = max(max(openrank.values()), 100.0) # Avoid div by zero
-        
-    max_activity = 50.0
-    if activity:
-        max_activity = max(max(activity.values()), 10.0)
-
     for i, n_id in enumerate(node_list):
-        # 1. Base Metrics (From OpenDigger or Mock if lib)
-        if n_id == repo_full_name:
-            # Target Project: Use REAL Data
-            # OpenRank Score (Higher OpenRank = Lower Risk)
-            current_openrank = list(openrank.values())[-1] if openrank else 0
-            norm_openrank = min(1.0, current_openrank / max_openrank)
-            score_openrank = 1.0 - norm_openrank 
-            
-            # Activity Score (Higher Activity = Lower Risk)
-            current_activity = list(activity.values())[-1] if activity else 0
-            norm_activity = min(1.0, current_activity / max_activity)
-            score_activity = 1.0 - norm_activity
-            
-        else:
-            # Dependency Lib: Use Heuristic based on name length/hash (Mock for now, but deterministic)
-            # In production, we would fetch OpenDigger for EVERY dependency too.
-            # DETERMINISTIC: Remove random.seed, use deterministic_random
-            score_openrank = 0.2 + (deterministic_random(n_id + "_rank") * 0.6) # 0.2 - 0.8
-            score_activity = 0.2 + (deterministic_random(n_id + "_act") * 0.6)  # 0.2 - 0.8
-            
+        # Retrieve Pre-calculated Base Risk (from Data Collection Phase)
+        # We stored it in nodes_data initially
+        node_obj = next((x for x in nodes_data if x['id'] == n_id), None)
+        base_risk = node_obj['risk_score'] if node_obj else 0.5
+        
         # 2. Topology Metrics (From EasyGraph)
-        # Constraint (Structural Hole): Higher Constraint = Higher Risk (Closed community)
         constraint_val = eg_metrics.get('constraint', {}).get(n_id, 0)
         # Normalize constraint (usually 0-1, but can be higher)
         score_constraint = min(1.0, constraint_val)
         
-        # Betweenness Centrality: Higher Centrality = Higher Impact Risk
         betweenness_val = eg_metrics.get('betweenness', {}).get(n_id, 0)
         # Normalize betweenness (usually small)
         score_centrality = min(1.0, betweenness_val * 5.0) # Boost for visibility
 
-        # 3. Weighted Fusion Model (Deterministic)
-        # Weights: OpenRank(40%) + Activity(30%) + Constraint(20%) + Centrality(10%)
-        final_risk = (score_openrank * 0.4) + \
-                     (score_activity * 0.3) + \
-                     (score_constraint * 0.2) + \
-                     (score_centrality * 0.1)
+        # 3. Weighted Fusion Model
+        # Fusion: 70% Base Risk (Data Driven) + 30% Topology (Graph Driven)
+        final_risk = (base_risk * 0.7) + (score_constraint * 0.2) + (score_centrality * 0.1)
         
-        final_risk = min(1.0, max(0.05, final_risk)) # Keep between 0.05 and 1.0
+        final_risk = min(1.0, max(0.05, final_risk))
         
-        # CONSISTENCY FIX: Override with Predefined Risk if available (Fallback only)
-        # Only use predefined if we have NO real data (e.g. network failure)
-        if not openrank and not activity and n_id in PREDEFINED_RISKS:
-             final_risk = PREDEFINED_RISKS[n_id] / 100.0
-        
-        # Generate History (Deterministic Trend based on Risk Score)
+        # Generate History (Simple fluctuation around the real risk)
         history = []
         current = final_risk
-        # DETERMINISTIC History
-        base_seed = deterministic_random(n_id + "history_base")
+        # DETERMINISTIC History (Re-introduced for UI stability, but based on real risk)
+        # Use zlib hash of name to seed the fluctuation pattern
+        h_seed = deterministic_hash(n_id)
         for k in range(6):
             history.insert(0, float(f"{current * 100:.1f}"))
-            # Trend mimics risk: High risk tends to be volatile
-            volatility = 0.1 if final_risk > 0.5 else 0.05
-            # Deterministic change based on step k
-            step_noise = (deterministic_random(f"{n_id}_step_{k}") - 0.5) * volatility
-            current = current + step_noise
+            # Pseudo-random fluctuation
+            fluctuation = ((h_seed + k) % 100 - 50) / 1000.0 # -0.05 to +0.05
+            current = current + fluctuation
             current = min(1.0, max(0.0, current))
 
         final_nodes.append(Node(
             id=n_id,
-            label="Project", 
+            label="Project" if n_id == repo_full_name else "Lib", 
             name=n_id,
             risk_score=final_risk,
-            description=f"Constraint: {constraint_val:.2f} | Rank: {score_openrank:.2f}",
+            description=f"Constraint: {constraint_val:.2f} | Risk: {final_risk:.2f}",
             history=history
         ))
 
@@ -212,8 +332,6 @@ async def get_dependency_graph(owner: str, repo: str):
     result = GraphData(nodes=final_nodes, edges=final_edges)
     
     # Update Cache
-    # We now cache ALL successfully analyzed repositories, not just specific ones.
-    # This acts as a dynamic "Knowledge Base" that grows as users search.
     ANALYSIS_CACHE[repo_full_name] = result
     
     return result
@@ -290,7 +408,8 @@ async def get_leaderboard():
     # Inject Low Risk Cache into Stars List
     for repo_name, graph_data in recent_items:
         root = next((n for n in graph_data.nodes if n.id == repo_name), None)
-        if root and root.risk_score <= 0.5: # FIX: Match the threshold (<= 0.5)
+        # Fix: Check for Low Risk (e.g. <= 0.4)
+        if root and root.risk_score <= 0.4: 
              if not any(item['name'] == repo_name for item in stars_list):
                 stars_list.append({
                     "rank": 99,
