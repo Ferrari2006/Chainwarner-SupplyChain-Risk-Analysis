@@ -30,8 +30,8 @@ agent_engine = AgentEngine()
 
 # In-Memory Cache (Persisted to JSON on write)
 ANALYSIS_CACHE = {}
-# Bump version to v2 to invalidate old "grey ball" cache
-CACHE_FILE = "analysis_cache_v2.json"
+# Bump version to v3 to invalidate old star-graph topology cache
+CACHE_FILE = "analysis_cache_v3.json"
 
 # Load cache from disk on startup
 try:
@@ -175,31 +175,57 @@ ECOSYSTEM_RELATIONS = {
     "webpack": ["webpack-sources", "webpack-cli"]
 }
 
+# Ecosystem Groups for "Cluster Linking"
+# If multiple nodes from the same group appear, we link them to simulate ecosystem coupling.
+ECOSYSTEM_GROUPS = [
+    {"name": "Pallets", "members": ["flask", "werkzeug", "jinja2", "itsdangerous", "click", "markupsafe"]},
+    {"name": "React", "members": ["react", "react-dom", "scheduler", "prop-types", "loose-envify", "object-assign"]},
+    {"name": "PyData", "members": ["numpy", "pandas", "scipy", "matplotlib", "seaborn", "scikit-learn"]},
+    {"name": "FastAPI", "members": ["fastapi", "uvicorn", "starlette", "pydantic"]},
+    {"name": "Requests", "members": ["requests", "urllib3", "idna", "certifi", "charset-normalizer"]},
+    {"name": "AntDesign", "members": ["antd", "react", "moment", "rc-util"]}
+]
+
 def enrich_graph_topology(nodes, edges):
     """
     Add edges between existing nodes based on known ecosystem relations.
     This reduces Burt's Constraint from 1.0 (Star Graph) to realistic values.
     """
-    # Create a set of existing node IDs for fast lookup
-    node_ids = set(n['id'] for n in nodes)
+    # Create a set of existing node IDs for fast lookup (Lower Case map)
+    # Map: lower_case_id -> original_id
+    node_map = {n['id'].lower(): n['id'] for n in nodes}
     
-    # Check each node to see if it implies other nodes
     extra_edges = []
-    for node in nodes:
-        src = node['id']
-        # Look up known children
-        # Handle simple name match or mapped name? 
-        # Our nodes use 'dep' name from package.json (e.g. "jinja2")
-        targets = ECOSYSTEM_RELATIONS.get(src.lower(), [])
-        
-        for tgt in targets:
-            if tgt in node_ids and tgt != src:
-                # Avoid duplicate edges
-                # Check if edge already exists? (O(N^2) but N is small < 20)
-                exists = any(e['source'] == src and e['target'] == tgt for e in edges)
-                if not exists:
-                    extra_edges.append({"source": src, "target": tgt})
     
+    # 1. Direct Relations (Parent -> Child)
+    for src_id in node_map.values():
+        targets = ECOSYSTEM_RELATIONS.get(src_id.lower(), [])
+        for tgt in targets:
+            tgt_lower = tgt.lower()
+            if tgt_lower in node_map and node_map[tgt_lower] != src_id:
+                real_tgt = node_map[tgt_lower]
+                # Check exist
+                if not any(e['source'] == src_id and e['target'] == real_tgt for e in edges):
+                     extra_edges.append({"source": src_id, "target": real_tgt})
+
+    # 2. Ecosystem Cluster Linking (Sibling <-> Sibling)
+    # This creates triangles and lowers constraint
+    for group in ECOSYSTEM_GROUPS:
+        # Find members present in current graph
+        present_members = [node_map[m] for m in group["members"] if m in node_map]
+        
+        # If 2 or more members exist, link them sequentially or fully
+        # Let's link them in a ring to avoid too many edges but create loops
+        if len(present_members) > 1:
+            for i in range(len(present_members)):
+                src = present_members[i]
+                tgt = present_members[(i + 1) % len(present_members)] # Wrap around
+                
+                # Don't duplicate if existing
+                if not any(e['source'] == src and e['target'] == tgt for e in edges) and \
+                   not any(e['source'] == tgt and e['target'] == src for e in edges): # Undirected logic
+                    extra_edges.append({"source": src, "target": tgt})
+
     edges.extend(extra_edges)
     return edges
 
