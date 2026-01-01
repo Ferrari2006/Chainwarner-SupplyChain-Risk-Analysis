@@ -30,7 +30,8 @@ agent_engine = AgentEngine()
 
 # In-Memory Cache (Persisted to JSON on write)
 ANALYSIS_CACHE = {}
-CACHE_FILE = "analysis_cache.json"
+# Bump version to v2 to invalidate old "grey ball" cache
+CACHE_FILE = "analysis_cache_v2.json"
 
 # Load cache from disk on startup
 try:
@@ -222,9 +223,51 @@ async def get_dependency_graph(owner: str, repo: str):
                 # Try pyproject.toml (Python modern) - simplified
                 toml_txt = await fetch_repo_file(owner, repo, "pyproject.toml")
                 if toml_txt:
-                    # Basic parsing for toml to avoid heavy lib
-                    import re
-                    dependencies = re.findall(r'([a-zA-Z0-9\-_]+)\s*=', toml_txt)
+                    # IMPROVED PARSER v2: Handles both PEP 621 (lists) and Poetry (tables)
+                    # This fixes the issue where metadata keys (name, version) were mistaken for deps
+                    dependencies = []
+                    lines = toml_txt.splitlines()
+                    in_poetry_block = False
+                    in_pep621_list = False
+                    
+                    for line in lines:
+                        line = line.strip()
+                        if not line or line.startswith("#"):
+                            continue
+                            
+                        # 1. Poetry Table Mode: [tool.poetry.dependencies]
+                        if line.startswith("[tool.poetry.dependencies]"):
+                            in_poetry_block = True
+                            in_pep621_list = False
+                            continue
+                        elif line.startswith("[") and in_poetry_block:
+                            in_poetry_block = False
+                            
+                        if in_poetry_block:
+                            # Match key = val
+                            match = re.match(r'^([a-zA-Z0-9\-_]+)\s*=', line)
+                            if match and match.group(1).lower() != "python":
+                                dependencies.append(match.group(1))
+
+                        # 2. PEP 621 List Mode: dependencies = [ ... ]
+                        if line.startswith("dependencies = ["):
+                            in_pep621_list = True
+                            # Check for inline items
+                            inline_deps = re.findall(r'"([a-zA-Z0-9\-_]+)(?:[<>=!~;].*)?"', line)
+                            for d in inline_deps:
+                                if d.lower() != "python": dependencies.append(d)
+                            if line.endswith("]"):
+                                in_pep621_list = False
+                            continue
+                        
+                        if in_pep621_list:
+                            if line.startswith("]"):
+                                in_pep621_list = False
+                                continue
+                            # Match list items: "package>=..."
+                            list_match = re.match(r'^"([a-zA-Z0-9\-_]+)(?:[<>=!~;].*)?"', line)
+                            if list_match and list_match.group(1).lower() != "python":
+                                dependencies.append(list_match.group(1))
                 else:
                     # Try CMakeLists.txt (C/C++) - simplified parsing
                     cmake_txt = await fetch_repo_file(owner, repo, "CMakeLists.txt")
