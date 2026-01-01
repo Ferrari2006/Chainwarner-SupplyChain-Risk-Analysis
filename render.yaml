@@ -1,0 +1,16 @@
+services:
+  - type: web
+    name: ChainWarner-backend
+    env: python
+    branch: feat/render-load-cache
+    plan: free
+    autoDeploy: true
+    repo: Ferrari2006/Chainwarner-SupplyChain-Risk-Analysis
+    rootDirectory: backend
+    buildCommand: pip install -r backend/requirements.txt
+    startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: PYTHONUNBUFFERED
+        value: "1"
+      - key: PIP_NO_CACHE_DIR
+        value: "off"
