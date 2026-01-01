@@ -5,126 +5,17 @@ from app.engines.ml_engine import MLEngine
 from app.engines.nlp_engine import NLPEngine
 from app.engines.agent_engine import AgentEngine
 from app.core.stream_processor import stream_processor
-import httpx
-import random
-# import torch # Removed to prevent OOM on Render Free Tier
-from functools import lru_cache
-import asyncio
-from pydantic import BaseModel
+import zlib
+import math
 
-router = APIRouter()
+# Helper for deterministic hash
+def deterministic_hash(s: str) -> int:
+    return zlib.adler32(s.encode('utf-8'))
 
-# Initialize Engines
-graph_engine = GraphEngine()
-ml_engine = MLEngine()
-nlp_engine = NLPEngine()
-agent_engine = AgentEngine()
-
-# --- Models ---
-class ChatRequest(BaseModel):
-    query: str
-    context_repo: str # e.g. "facebook/react"
-
-# --- Endpoints ---
-# lru_cache blocks execution if used on async functions directly without wrapper
-ANALYSIS_CACHE = {}
-
-# Predefined Risks to ensure consistency between Leaderboard and Details
-PREDEFINED_RISKS = {
-    "apache/struts": 95.2,
-    "fastjson/fastjson": 92.8,
-    "log4j/log4j2": 88.5,
-    "openssl/openssl": 85.1,
-    "jenkins/jenkins": 82.4,
-    "struts/struts2": 80.9,
-    "spring/spring-framework": 78.3,
-    "axios/axios": 75.6,
-    "lodash/lodash": 72.1,
-    "moment/moment": 70.8,
-    "express/express": 68.4,
-    "vuejs/vue": 65.7,
-    "angular/angular": 62.3,
-    "django/django": 60.5,
-    "flask/flask": 58.9,
-    "torvalds/linux": 5.2,
-    "kubernetes/kubernetes": 8.1,
-    "facebook/react": 12.4,
-    "tensorflow/tensorflow": 15.3,
-    "microsoft/vscode": 18.7,
-    "flutter/flutter": 20.2,
-    "golang/go": 22.5,
-    "rust-lang/rust": 23.8,
-    "denoland/deno": 25.1,
-    "nodejs/node": 28.4,
-    "electron/electron": 30.6,
-    "tauri-apps/tauri": 32.2,
-    "vercel/next.js": 33.9,
-    "nestjs/nest": 35.5,
-    "ant-design/ant-design": 36.8
-}
-
-async def fetch_repo_file(owner: str, repo: str, path: str):
-    """
-    Multi-Source Fusion: Fetch raw file from GitHub -> Gitee -> GitLab (Waterfall)
-    """
-    async with httpx.AsyncClient() as client:
-        # 1. Try GitHub (Primary)
-        github_url = f"https://raw.githubusercontent.com/{owner}/{repo}/HEAD/{path}"
-        try:
-            resp = await client.get(github_url, timeout=3.0)
-            if resp.status_code == 200:
-                print(f"[Fusion] Fetched from GitHub: {github_url}")
-                return resp.text
-        except:
-            pass
-
-        # 2. Try Gitee (China Mirror)
-        # Gitee raw structure: gitee.com/owner/repo/raw/master/path
-        gitee_url = f"https://gitee.com/{owner}/{repo}/raw/master/{path}"
-        try:
-            resp = await client.get(gitee_url, timeout=3.0)
-            if resp.status_code == 200:
-                print(f"[Fusion] Fetched from Gitee: {gitee_url}")
-                return resp.text
-        except:
-            pass
-
-        # 3. Try GitLab (Alternative)
-        # GitLab raw structure: gitlab.com/owner/repo/-/raw/main/path
-        gitlab_url = f"https://gitlab.com/{owner}/{repo}/-/raw/main/{path}"
-        try:
-            resp = await client.get(gitlab_url, timeout=3.0)
-            if resp.status_code == 200:
-                print(f"[Fusion] Fetched from GitLab: {gitlab_url}")
-                return resp.text
-        except:
-            pass
-            
-    return None
-
-def parse_dependencies(content: str, file_type: str):
-    """Parse dependencies from package.json or requirements.txt"""
-    deps = []
-    try:
-        if file_type == 'json':
-            import json
-            data = json.loads(content)
-            if 'dependencies' in data:
-                deps.extend(list(data['dependencies'].keys()))
-            if 'devDependencies' in data:
-                deps.extend(list(data['devDependencies'].keys()))
-        elif file_type == 'txt':
-            for line in content.splitlines():
-                line = line.strip()
-                if line and not line.startswith('#'):
-                    # Simple parsing for requirements.txt (e.g. "numpy==1.21.0" -> "numpy")
-                    import re
-                    match = re.match(r'^([a-zA-Z0-9\-_]+)', line)
-                    if match:
-                        deps.append(match.group(1))
-    except:
-        pass
-    return list(set(deps)) # Unique
+# Helper for deterministic pseudo-random float
+def deterministic_random(seed_str: str) -> float:
+    h = deterministic_hash(seed_str)
+    return (h % 10000) / 10000.0
 
 @router.get("/graph/{owner}/{repo}", response_model=GraphData)
 async def get_dependency_graph(owner: str, repo: str):
@@ -194,14 +85,18 @@ async def get_dependency_graph(owner: str, repo: str):
     # Create topology
     for dep in dependencies:
         # Assign semi-realistic risk based on name length (just for variance)
-        risk_val = (hash(dep) % 100) / 100.0 
+        # DETERMINISTIC: Use zlib.adler32 instead of hash()
+        h_val = deterministic_hash(dep)
+        risk_val = (h_val % 100) / 100.0 
         nodes_data.append({"id": dep, "risk_score": risk_val, "type": "Lib"})
         edges_data.append({"source": repo_full_name, "target": dep})
         
         # Add Transitive Dependencies (2nd Hop) - Reduced probability for cleaner graph
-        if hash(dep) % 3 == 0: 
+        if h_val % 3 == 0: 
             sub_dep = f"{dep}-core"
-            nodes_data.append({"id": sub_dep, "risk_score": (risk_val * 0.8) % 1.0, "type": "Plugin"})
+            # DETERMINISTIC risk for sub-dep
+            sub_risk = (deterministic_hash(sub_dep) % 100) / 100.0
+            nodes_data.append({"id": sub_dep, "risk_score": sub_risk, "type": "Plugin"})
             edges_data.append({"source": dep, "target": sub_dep})
 
     # Load into Graph Engine
@@ -212,7 +107,8 @@ async def get_dependency_graph(owner: str, repo: str):
     
     # Mock Constraint if missing (EasyGraph sometimes fails on very small/disconnected graphs)
     if 'constraint' not in eg_metrics or not eg_metrics['constraint']:
-        eg_metrics['constraint'] = {n['id']: random.random() for n in nodes_data}
+        # DETERMINISTIC: Use deterministic_random seeded by node id
+        eg_metrics['constraint'] = {n['id']: deterministic_random(n['id'] + "_constraint") for n in nodes_data}
     
     # --- 4. AI Prediction Phase (PyTorch GNN) ---
     # Prepare features for GNN: [Risk, InDegree, OutDegree, Constraint, Betweenness, PageRank]
@@ -222,12 +118,13 @@ async def get_dependency_graph(owner: str, repo: str):
     node_list = list(graph_engine.G.nodes) # <--- Ensure this is uncommented
     # ... (GNN Logic skipped for stability) ...
     
-    gnn_probs = [random.random() for _ in range(len(graph_engine.G.nodes))] # Mock GNN
+    # DETERMINISTIC GNN Probs
+    gnn_probs = [deterministic_random(n + "_gnn") for n in node_list] # Deterministic Mock GNN
 
     # --- 5. NLP Analysis Phase ---
     # Mock commit messages
     # nlp_risk = nlp_engine.analyze_text_risk(mock_commits) # Skipped for stability
-    nlp_risk = random.random() * 0.8 # Mock NLP
+    nlp_risk = deterministic_random(repo_full_name + "_nlp") * 0.8 # Deterministic Mock NLP
 
     # --- 6. Fusion & Response Construction ---
     final_nodes = []
@@ -258,9 +155,9 @@ async def get_dependency_graph(owner: str, repo: str):
         else:
             # Dependency Lib: Use Heuristic based on name length/hash (Mock for now, but deterministic)
             # In production, we would fetch OpenDigger for EVERY dependency too.
-            random.seed(n_id) # Deterministic Seed!
-            score_openrank = random.uniform(0.2, 0.8)
-            score_activity = random.uniform(0.2, 0.8)
+            # DETERMINISTIC: Remove random.seed, use deterministic_random
+            score_openrank = 0.2 + (deterministic_random(n_id + "_rank") * 0.6) # 0.2 - 0.8
+            score_activity = 0.2 + (deterministic_random(n_id + "_act") * 0.6)  # 0.2 - 0.8
             
         # 2. Topology Metrics (From EasyGraph)
         # Constraint (Structural Hole): Higher Constraint = Higher Risk (Closed community)
@@ -290,13 +187,15 @@ async def get_dependency_graph(owner: str, repo: str):
         # Generate History (Deterministic Trend based on Risk Score)
         history = []
         current = final_risk
-        random.seed(n_id + "history") # Deterministic history
-        for _ in range(6):
+        # DETERMINISTIC History
+        base_seed = deterministic_random(n_id + "history_base")
+        for k in range(6):
             history.insert(0, float(f"{current * 100:.1f}"))
             # Trend mimics risk: High risk tends to be volatile
             volatility = 0.1 if final_risk > 0.5 else 0.05
-            change = (random.random() - 0.5) * volatility
-            current = current + change
+            # Deterministic change based on step k
+            step_noise = (deterministic_random(f"{n_id}_step_{k}") - 0.5) * volatility
+            current = current + step_noise
             current = min(1.0, max(0.0, current))
 
         final_nodes.append(Node(
@@ -345,12 +244,17 @@ async def get_leaderboard():
     ]
     
     # Try to inject recently analyzed high-risk projects from cache
-    for repo_name, graph_data in list(ANALYSIS_CACHE.items())[:10]: # Check last 10 analyzed
+    # FIX: Get NEWEST 10 items (reversed list of dict items)
+    cached_items = list(ANALYSIS_CACHE.items())
+    recent_items = list(reversed(cached_items))[:10]
+    
+    for repo_name, graph_data in recent_items: 
         # Find root node
         root = next((n for n in graph_data.nodes if n.id == repo_name), None)
         if root:
             # Inject High Risk into Critical List
-            if root.risk_score > 0.6:
+            # FIX: Lower threshold to ensure visibility (e.g. > 0.5)
+            if root.risk_score > 0.5:
                 if not any(item['name'] == repo_name for item in critical_list):
                     critical_list.append({
                         "rank": 99, 
@@ -360,8 +264,8 @@ async def get_leaderboard():
                     })
             
             # Inject Low Risk into Stars List
-            # Only inject if safer than the worst item on the current list (approx < 0.4)
-            elif root.risk_score < 0.4: 
+            # FIX: Cover the remaining range (<= 0.5) so nothing is lost
+            else: 
                 # Define stars_list reference to modify it below
                 pass # Logic handled in next block to avoid scope issues
     
@@ -384,9 +288,9 @@ async def get_leaderboard():
     ]
 
     # Inject Low Risk Cache into Stars List
-    for repo_name, graph_data in list(ANALYSIS_CACHE.items())[:10]:
+    for repo_name, graph_data in recent_items:
         root = next((n for n in graph_data.nodes if n.id == repo_name), None)
-        if root and root.risk_score < 0.4:
+        if root and root.risk_score <= 0.5: # FIX: Match the threshold (<= 0.5)
              if not any(item['name'] == repo_name for item in stars_list):
                 stars_list.append({
                     "rank": 99,
