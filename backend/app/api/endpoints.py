@@ -173,8 +173,8 @@ async def get_dependency_graph(owner: str, repo: str):
         nodes_data[0]['description'] += " | Error: No deps found"
     
     # Limit graph size for performance (but fetch real data for these)
-    # INCREASED: 15 -> 50 for better demo
-    dependencies = dependencies[:50] 
+    # REVERTED: 50 -> 15 to fix timeout issues
+    dependencies = dependencies[:15] 
     
     # Real Data Fetching for Dependencies
     dep_metrics = {}
