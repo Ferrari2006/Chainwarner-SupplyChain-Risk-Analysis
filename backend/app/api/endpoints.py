@@ -18,89 +18,100 @@ from fastapi.responses import StreamingResponse
 import time
 import tracemalloc
 from typing import Optional
+    # Try package files at common locations (root and common subpaths)
+    pkg_candidates = [
+        "package.json",
+        "packages/package.json",
+        "packages/react/package.json",
+        "backend/package.json",
+        "server/package.json",
+        "api/package.json",
+        "app/package.json",
+    ]
+    pkg_json, pkg_path = await fetch_first_existing(owner, repo, pkg_candidates)
+    if pkg_json:
+        dependencies = parse_dependencies(pkg_json, 'json')
+        ecosystem = 'npm'
+    else:
+        # Try requirements files in common locations
+        req_candidates = [
+            "requirements.txt",
+            "backend/requirements.txt",
+            "server/requirements.txt",
+            "api/requirements.txt",
+            "app/requirements.txt",
+        ]
+        req_txt, req_path = await fetch_first_existing(owner, repo, req_candidates)
+        if req_txt:
+            dependencies = parse_dependencies(req_txt, 'txt')
+            ecosystem = 'PyPI'
+        else:
+            # Try pyproject.toml (PEP 621 / Poetry) in common locations
+            toml_candidates = [
+                "pyproject.toml",
+                "backend/pyproject.toml",
+                "server/pyproject.toml",
+                "api/pyproject.toml",
+                "app/pyproject.toml",
+            ]
+            toml_txt, toml_path = await fetch_first_existing(owner, repo, toml_candidates)
+            if toml_txt:
+                ecosystem = 'PyPI'
+                # IMPROVED PARSER v2: Handles both PEP 621 (lists) and Poetry (tables)
+                dependencies = []
+                lines = toml_txt.splitlines()
+                in_poetry_block = False
+                in_pep621_list = False
 
-router = APIRouter()
+                for line in lines:
+                    line = line.strip()
+                    if not line or line.startswith("#"):
+                        continue
 
-class ChatRequest(BaseModel):
-    query: str
-    context_repo: str
+                    # 1. Poetry Table Mode: [tool.poetry.dependencies]
+                    if line.startswith("[tool.poetry.dependencies]"):
+                        in_poetry_block = True
+                        in_pep621_list = False
+                        continue
+                    elif line.startswith("[") and in_poetry_block:
+                        in_poetry_block = False
 
-# Global Engines
+                    if in_poetry_block:
+                        # Match key = val
+                        match = re.match(r'^([a-zA-Z0-9\-_]+)\s*=', line)
+                        if match and match.group(1).lower() != "python":
+                            dependencies.append(match.group(1))
 
-graph_engine = GraphEngine()
-ml_engine = MLEngine() 
-nlp_engine = NLPEngine()
-agent_engine = AgentEngine()
+                    # 2. PEP 621 List Mode: dependencies = [ ... ]
+                    if line.startswith("dependencies = ["):
+                        in_pep621_list = True
+                        # Check for inline items
+                        inline_deps = re.findall(r'"([a-zA-Z0-9\-_]+)(?:[<>=!~;].*)?"', line)
+                        for d in inline_deps:
+                            if d.lower() != "python": dependencies.append(d)
+                        if line.endswith("]"):
+                            in_pep621_list = False
+                        continue
 
-# In-Memory Cache (Persisted to JSON on write)
-ANALYSIS_CACHE = {}
-# Bump version to v3 to invalidate old star-graph topology cache
-CACHE_FILE = "analysis_cache_v3.json"
-# Configurable runtime limits
-CACHE_MAX_ITEMS = int(os.getenv("CHAINWARNER_CACHE_MAX", "50"))
-# Concurrency limits (tunable via env vars)
-DEFAULT_CONCURRENCY_REPO_FETCH = int(os.getenv("CHAINWARNER_CONCURRENCY_REPO", "6"))
-DEFAULT_CONCURRENCY_OSV = int(os.getenv("CHAINWARNER_CONCURRENCY_OSV", "6"))
-# Batch processing for incremental fetching (to support low-memory platforms)
-BATCH_SIZE = int(os.getenv("CHAINWARNER_BATCH_SIZE", "5"))
-BATCH_DELAY = float(os.getenv("CHAINWARNER_BATCH_DELAY", "0.05"))
-
-# Progress map for in-progress analyses
-ANALYSIS_PROGRESS = {}
-
-# Notification queue for SSE
-NOTIFICATION_QUEUE: "asyncio.Queue[str]" = asyncio.Queue()
-
-
-async def push_notification(message: str):
-    """Push a notification into the queue for SSE subscribers."""
-    try:
-        await NOTIFICATION_QUEUE.put(message)
-    except Exception:
-        pass
-
-
-async def async_retry(coro_fn, *args, retries: int = 3, backoff: float = 0.5, allowed_exceptions=(Exception,), **kwargs):
-    """Simple exponential backoff retry wrapper for coroutine functions."""
-    attempt = 0
-    while True:
-        try:
-            return await coro_fn(*args, **kwargs)
-        except allowed_exceptions as e:
-            attempt += 1
-            if attempt > retries:
-                raise
-            await asyncio.sleep(backoff * (2 ** (attempt - 1)))
-
-# Load cache from disk on startup
-try:
-    if os.path.exists(CACHE_FILE):
-        with open(CACHE_FILE, 'r') as f:
-            # Need to reconstruct GraphData objects from dict
-            raw_cache = json.load(f)
-            for k, v in raw_cache.items():
-                # Reconstruct Node and Edge objects
-                nodes = [Node(**n) for n in v['nodes']]
-                edges = [Edge(**e) for e in v['edges']]
-                ANALYSIS_CACHE[k] = GraphData(nodes=nodes, edges=edges)
-            print(f"Loaded {len(ANALYSIS_CACHE)} items from cache.")
-except Exception as e:
-    print(f"Failed to load cache: {e}")
-
-def save_cache():
-    try:
-        # Convert Pydantic models to dicts for JSON serialization
-        serializable_cache = {k: v.dict() for k, v in ANALYSIS_CACHE.items()}
-        # Atomic write to avoid partial/corrupt files on crashes
-        tmp = CACHE_FILE + ".tmp"
-        with open(tmp, 'w', encoding='utf-8') as f:
-            json.dump(serializable_cache, f)
-        os.replace(tmp, CACHE_FILE)
-    except Exception as e:
-        print(f"Failed to save cache: {e}")
-
-# Fallback Risks for demo if network fails
-PREDEFINED_RISKS = {
+                    if in_pep621_list:
+                        if line.startswith("]"):
+                            in_pep621_list = False
+                            continue
+                        # Match list items: "package>=..."
+                        list_match = re.match(r'^"([a-zA-Z0-9\-_]+)(?:[<>=!~;].*)?"', line)
+                        if list_match and list_match.group(1).lower() != "python":
+                            dependencies.append(list_match.group(1))
+            else:
+                # Try CMakeLists.txt / Makefile in common locations
+                cmake_candidates = ["CMakeLists.txt", "backend/CMakeLists.txt", "server/CMakeLists.txt"]
+                cmake_txt, cmake_path = await fetch_first_existing(owner, repo, cmake_candidates)
+                if cmake_txt:
+                    dependencies = re.findall(r'find_package\s*\(\s*([a-zA-Z0-9_]+)', cmake_txt, re.IGNORECASE)
+                else:
+                    make_candidates = ["Makefile", "backend/Makefile", "server/Makefile"]
+                    makefile_txt, makefile_path = await fetch_first_existing(owner, repo, make_candidates)
+                    if makefile_txt:
+                        dependencies = re.findall(r'-l([a-zA-Z0-9_]+)', makefile_txt)
     "log4j": 95,
     "fastjson": 90, 
     "struts2": 85,
@@ -122,6 +133,22 @@ async def fetch_repo_file(owner: str, repo: str, path: str) -> str:
         except:
             pass
     return None
+
+
+async def fetch_first_existing(owner: str, repo: str, candidates: List[str]) -> (str, Optional[str]):
+    """Try a list of candidate paths and return the first content and its path."""
+    tried = set()
+    for p in candidates:
+        if not p or p in tried:
+            continue
+        tried.add(p)
+        try:
+            content = await fetch_repo_file(owner, repo, p)
+            if content:
+                return content, p
+        except Exception:
+            continue
+    return None, None
 
 def parse_dependencies(content: str, fmt: str) -> List[str]:
     """Extract dependency names from package files."""
