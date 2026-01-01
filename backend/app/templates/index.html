@@ -289,7 +289,7 @@
         
         <div class="header-center">
             <div class="top-search-box">
-                <input type="text" id="repoInput" value="facebook/react" placeholder="输入 owner/repo (e.g., pytorch/pytorch)">
+                <input type="text" id="repoInput" value="facebook/react" placeholder="输入 owner/repo (e.g., pytorch/pytorch)" onkeypress="if(event.key === 'Enter') loadGraph()">
                 <button onclick="loadGraph()">深度分析</button>
             </div>
         </div>
