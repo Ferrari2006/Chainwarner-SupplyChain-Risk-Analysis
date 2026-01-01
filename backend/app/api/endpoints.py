@@ -14,6 +14,10 @@ import re
 import os
 from typing import List, Dict, Any
 from pydantic import BaseModel
+from fastapi.responses import StreamingResponse
+import time
+import tracemalloc
+from typing import Optional
 
 router = APIRouter()
 
@@ -32,6 +36,41 @@ agent_engine = AgentEngine()
 ANALYSIS_CACHE = {}
 # Bump version to v3 to invalidate old star-graph topology cache
 CACHE_FILE = "analysis_cache_v3.json"
+# Configurable runtime limits
+CACHE_MAX_ITEMS = int(os.getenv("CHAINWARNER_CACHE_MAX", "50"))
+# Concurrency limits (tunable via env vars)
+DEFAULT_CONCURRENCY_REPO_FETCH = int(os.getenv("CHAINWARNER_CONCURRENCY_REPO", "6"))
+DEFAULT_CONCURRENCY_OSV = int(os.getenv("CHAINWARNER_CONCURRENCY_OSV", "6"))
+# Batch processing for incremental fetching (to support low-memory platforms)
+BATCH_SIZE = int(os.getenv("CHAINWARNER_BATCH_SIZE", "5"))
+BATCH_DELAY = float(os.getenv("CHAINWARNER_BATCH_DELAY", "0.05"))
+
+# Progress map for in-progress analyses
+ANALYSIS_PROGRESS = {}
+
+# Notification queue for SSE
+NOTIFICATION_QUEUE: "asyncio.Queue[str]" = asyncio.Queue()
+
+
+async def push_notification(message: str):
+    """Push a notification into the queue for SSE subscribers."""
+    try:
+        await NOTIFICATION_QUEUE.put(message)
+    except Exception:
+        pass
+
+
+async def async_retry(coro_fn, *args, retries: int = 3, backoff: float = 0.5, allowed_exceptions=(Exception,), **kwargs):
+    """Simple exponential backoff retry wrapper for coroutine functions."""
+    attempt = 0
+    while True:
+        try:
+            return await coro_fn(*args, **kwargs)
+        except allowed_exceptions as e:
+            attempt += 1
+            if attempt > retries:
+                raise
+            await asyncio.sleep(backoff * (2 ** (attempt - 1)))
 
 # Load cache from disk on startup
 try:
@@ -52,8 +91,11 @@ def save_cache():
     try:
         # Convert Pydantic models to dicts for JSON serialization
         serializable_cache = {k: v.dict() for k, v in ANALYSIS_CACHE.items()}
-        with open(CACHE_FILE, 'w') as f:
+        # Atomic write to avoid partial/corrupt files on crashes
+        tmp = CACHE_FILE + ".tmp"
+        with open(tmp, 'w', encoding='utf-8') as f:
             json.dump(serializable_cache, f)
+        os.replace(tmp, CACHE_FILE)
     except Exception as e:
         print(f"Failed to save cache: {e}")
 
@@ -251,15 +293,20 @@ async def get_dependency_graph(owner: str, repo: str):
     async def query_osv(package: str, ecosystem: str = 'PyPI') -> int:
         url = "https://api.osv.dev/v1/query"
         body = {"package": {"name": package, "ecosystem": ecosystem}}
-        try:
+
+        async def _call_osv():
             async with httpx.AsyncClient() as client:
                 resp = await client.post(url, json=body, timeout=5.0)
                 if resp.status_code == 200:
                     data = resp.json()
                     return len(data.get('vulns', []))
-        except:
             return 0
-        return 0
+
+        try:
+            # Use retry wrapper to be resilient against transient errors
+            return await async_retry(_call_osv, retries=3, backoff=0.5)
+        except Exception:
+            return 0
     """
     Advanced Risk Analysis Endpoint (Optimized):
     1. Fetches real OpenDigger data using STREAMING (Memory Friendly).
@@ -285,40 +332,89 @@ async def get_dependency_graph(owner: str, repo: str):
         base_score = max(0.0, 1.0 - (latest / 20.0)) # Higher activity = Lower risk
 
     # --- 2. Graph Construction Phase ---
-    nodes_data = []
-    edges_data = []
-    
-    # Root Node
-    nodes_data.append({"id": repo_full_name, "risk_score": base_score, "type": "Target", "description": "Target Project"})
-    
-    # 100% Real Dependency Fetching
-    dependencies = []
-    ecosystem = None
-    
-    # Try package.json (Node.js)
-    # FIX: Try raw.githubusercontent.com again as primary, jsDelivr as fallback
-    # Some repos structure might be different or jsDelivr might be caching old/missing files
-    pkg_json = await fetch_repo_file(owner, repo, "package.json")
-    if pkg_json:
-        dependencies = parse_dependencies(pkg_json, 'json')
-        ecosystem = 'npm'
-    else:
-        # Try finding in root, if fail, try standard mono-repo paths like "packages/react/package.json"
-        # React specific fix: React repo is a monorepo, core is in packages/react
-        if repo == "react":
-             pkg_json = await fetch_repo_file(owner, repo, "packages/react/package.json")
-             if pkg_json:
-                 dependencies = parse_dependencies(pkg_json, 'json')
-        
-        if not dependencies:
-            # Try requirements.txt (Python)
-            req_txt = await fetch_repo_file(owner, repo, "requirements.txt")
-            if req_txt:
-                dependencies = parse_dependencies(req_txt, 'txt')
-                ecosystem = 'PyPI'
-            else:
-                # Try pyproject.toml (Python modern) - simplified
-                toml_txt = await fetch_repo_file(owner, repo, "pyproject.toml")
+    dep_metrics = {}
+
+    # Initialize progress tracker and placeholder cache entry so frontend can show partial results
+    total_deps = len(dependencies)
+    ANALYSIS_PROGRESS[repo_full_name] = {"total": total_deps, "done": 0, "status": "in_progress"}
+
+    async def fetch_dep_metrics(dep_name, ecosystem):
+        mapped_name = resolve_repo_name(dep_name)
+        # Fetch both metrics in parallel under repo semaphore, with retries
+        async def _fetch_metrics():
+            async with repo_sem:
+                return await asyncio.gather(
+                    stream_processor.fetch_and_store(mapped_name, "activity"),
+                    stream_processor.fetch_and_store(mapped_name, "openrank"),
+                    return_exceptions=True
+                )
+
+        try:
+            d_act, d_rank = await async_retry(_fetch_metrics, retries=2, backoff=0.2)
+        except Exception:
+            d_act, d_rank = None, None
+
+        if isinstance(d_act, Exception) or not d_act:
+            d_act = None
+        if isinstance(d_rank, Exception) or not d_rank:
+            d_rank = None
+
+        cve_count = 0
+        if ecosystem:
+            try:
+                cve_count = await async_retry(lambda: query_osv(dep_name, ecosystem), retries=2, backoff=0.2)
+            except Exception:
+                cve_count = 0
+
+        return dep_name, mapped_name, d_act, d_rank, cve_count
+
+    # Process dependencies in batches, persisting incremental results
+    if dependencies:
+        # We'll build nodes/edges incrementally to avoid holding large intermediate structures
+        # nodes_data already contains the root node; edges_data starts empty
+        for i in range(0, total_deps, BATCH_SIZE):
+            batch = dependencies[i:i + BATCH_SIZE]
+            tasks = [asyncio.create_task(fetch_dep_metrics(d, ecosystem)) for d in batch]
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+
+            processed = 0
+            for res in results:
+                if isinstance(res, Exception) or not res:
+                    continue
+                dep_name, mapped_name, d_act, d_rank, cve_count = res
+                dep_metrics[dep_name] = {
+                    "mapped_name": mapped_name,
+                    "activity": d_act,
+                    "openrank": d_rank,
+                    "cve_count": cve_count
+                }
+
+                # Build node/edge immediately so partial GraphData is available
+                node_id = mapped_name
+                # Avoid duplicate nodes
+                if not any(n['id'] == node_id for n in nodes_data):
+                    desc = f"CVEs: {cve_count} | Risk: 50.0 (pending)"
+                    nodes_data.append({"id": node_id, "risk_score": 0.5, "type": "Lib", "description": desc, "cve_count": cve_count})
+                    edges_data.append({"source": repo_full_name, "target": node_id})
+                processed += 1
+
+            # Update progress and persist partial cache
+            ANALYSIS_PROGRESS[repo_full_name]["done"] = min(total_deps, ANALYSIS_PROGRESS[repo_full_name].get("done", 0) + processed)
+
+            try:
+                # Store partial GraphData so frontend can poll for incremental updates
+                partial_nodes = [Node(**n) for n in nodes_data]
+                partial_edges = [Edge(**e) for e in edges_data]
+                ANALYSIS_CACHE[repo_full_name] = GraphData(nodes=partial_nodes, edges=partial_edges)
+                save_cache()
+            except Exception:
+                pass
+
+            # Gentle pause to yield resources on tight platforms
+            try:
+                await asyncio.sleep(BATCH_DELAY)
+            except Exception:
+                pass
                 if toml_txt:
                     ecosystem = 'PyPI'
                     # IMPROVED PARSER v2: Handles both PEP 621 (lists) and Poetry (tables)
@@ -399,32 +495,52 @@ async def get_dependency_graph(owner: str, repo: str):
     # Real Data Fetching for Dependencies
     dep_metrics = {}
     
+    # Bounded concurrency semaphores to limit memory/connection usage on platforms like Render
+    repo_sem = asyncio.Semaphore(DEFAULT_CONCURRENCY_REPO_FETCH)
+    osv_sem = asyncio.Semaphore(DEFAULT_CONCURRENCY_OSV)
+
     async def fetch_dep_metrics(dep_name, ecosystem):
         mapped_name = resolve_repo_name(dep_name)
-        # Fetch both metrics in parallel for this dependency
-        # IMPORTANT: Use return_exceptions=True to prevent one failure from killing all
-        d_act, d_rank = await asyncio.gather(
-            stream_processor.fetch_and_store(mapped_name, "activity"),
-            stream_processor.fetch_and_store(mapped_name, "openrank"),
-            return_exceptions=True
-        )
-        # Handle exceptions/None
-        if isinstance(d_act, Exception) or not d_act: 
-            # print(f"Failed activity for {mapped_name}: {d_act}")
+
+        # Fetch metrics under repo_sem to bound concurrent stream_processor calls
+        async with repo_sem:
+            try:
+                d_act, d_rank = await asyncio.gather(
+                    stream_processor.fetch_and_store(mapped_name, "activity"),
+                    stream_processor.fetch_and_store(mapped_name, "openrank"),
+                    return_exceptions=True
+                )
+            except Exception:
+                d_act, d_rank = None, None
+
+        # Normalize exceptions/None
+        if isinstance(d_act, Exception) or not d_act:
             d_act = None
-        if isinstance(d_rank, Exception) or not d_rank: 
-            # print(f"Failed openrank for {mapped_name}: {d_rank}")
+        if isinstance(d_rank, Exception) or not d_rank:
             d_rank = None
-            
-        cve_count = await query_osv(dep_name, ecosystem) if ecosystem else 0
+
+        # OSV queries also throttled
+        cve_count = 0
+        if ecosystem:
+            async with osv_sem:
+                try:
+                    cve_count = await query_osv(dep_name, ecosystem)
+                except Exception:
+                    cve_count = 0
+
         return dep_name, mapped_name, d_act, d_rank, cve_count
 
     # Spawn tasks for all dependencies
     # FIX: Ensure we actually wait for them
     if dependencies:
-        fetch_tasks = [fetch_dep_metrics(d, ecosystem) for d in dependencies]
-        results = await asyncio.gather(*fetch_tasks)
-        for dep_name, mapped_name, d_act, d_rank, cve_count in results:
+        # Create tasks but let semaphores throttle concurrency
+        fetch_tasks = [asyncio.create_task(fetch_dep_metrics(d, ecosystem)) for d in dependencies]
+        # Await all tasks; semaphores prevent overloading
+        results = await asyncio.gather(*fetch_tasks, return_exceptions=True)
+        for res in results:
+            if isinstance(res, Exception) or not res:
+                continue
+            dep_name, mapped_name, d_act, d_rank, cve_count = res
             dep_metrics[dep_name] = {
                 "mapped_name": mapped_name,
                 "activity": d_act,
@@ -559,15 +675,22 @@ async def get_dependency_graph(owner: str, repo: str):
     
     result = GraphData(nodes=final_nodes, edges=final_edges)
     
-    # Update Cache
+    # Update Cache with eviction to bound memory
     ANALYSIS_CACHE[repo_full_name] = result
+    # Evict oldest if over limit
+    try:
+        while len(ANALYSIS_CACHE) > CACHE_MAX_ITEMS:
+            oldest = next(iter(ANALYSIS_CACHE))
+            del ANALYSIS_CACHE[oldest]
+    except Exception:
+        pass
     # Persist immediately
     save_cache()
     
     return result
 
 @router.get("/leaderboard")
-async def get_leaderboard():
+async def get_leaderboard(page: int = 1, per_page: int = 15):
     """
     Returns curated lists of projects for the dashboard.
     Dynamically mixes in cached recent searches to make the leaderboard feel "alive".
@@ -687,16 +810,82 @@ async def get_leaderboard():
     for i, item in enumerate(stars_list):
         item['rank'] = i + 1
     
+    alerts = [
+        "🚨 [Critical] New RCE vulnerability detected in 'fastjson' (CVE-2025-XXXX).",
+        "⚠️ [Warning] 'colors.js' maintainer account suspicious activity detected.",
+        "ℹ️ [Info] 'pytorch' released security patch v2.1.3.",
+        "📉 [Trend] 'request' library activity dropped by 40% in last month."
+    ]
+
+    # Push alerts to notification queue (non-blocking)
+    for a in alerts:
+        try:
+            asyncio.create_task(push_notification(a))
+        except Exception:
+            pass
+
+    # Pagination helpers
+    def paginate(lst, page, per_page):
+        start = (page - 1) * per_page
+        end = start + per_page
+        return lst[start:end]
+
     return {
-        "critical": critical_list,
-        "stars": stars_list,
-        "alerts": [
-            "🚨 [Critical] New RCE vulnerability detected in 'fastjson' (CVE-2025-XXXX).",
-            "⚠️ [Warning] 'colors.js' maintainer account suspicious activity detected.",
-            "ℹ️ [Info] 'pytorch' released security patch v2.1.3.",
-            "📉 [Trend] 'request' library activity dropped by 40% in last month."
-        ]
+        "critical": paginate(critical_list, page, per_page),
+        "stars": paginate(stars_list, page, per_page),
+        "alerts": alerts,
+        "page": page,
+        "per_page": per_page
     }
+
+
+@router.get("/progress/{owner}/{repo}")
+async def get_analysis_progress(owner: str, repo: str):
+    repo_full = f"{owner}/{repo}"
+    prog = ANALYSIS_PROGRESS.get(repo_full)
+    if not prog:
+        return {"status": "not_found"}
+    return prog
+
+
+@router.get('/events')
+async def sse_events():
+    """Server-Sent Events endpoint for notifications."""
+    async def event_generator():
+        while True:
+            try:
+                msg = await NOTIFICATION_QUEUE.get()
+                yield f"data: {msg}\n\n"
+            except asyncio.CancelledError:
+                break
+            except Exception:
+                await asyncio.sleep(0.1)
+
+    return StreamingResponse(event_generator(), media_type='text/event-stream')
+
+
+@router.get('/bench')
+async def bench():
+    """Lightweight benchmark: measures async call latency and memory snapshot."""
+    # Measure a small OSV call latency (non-blocking, quick)
+    start = time.perf_counter()
+    try:
+        await async_retry(lambda: query_osv('requests', 'PyPI'), retries=2, backoff=0.2)
+    except Exception:
+        pass
+    t1 = time.perf_counter() - start
+
+    # Memory snapshot using tracemalloc (lightweight)
+    try:
+        tracemalloc.start()
+        snapshot = tracemalloc.take_snapshot()
+        top_stats = snapshot.statistics('lineno')[:3]
+        mem_info = sum(s.size for s in top_stats)
+        tracemalloc.stop()
+    except Exception:
+        mem_info = 0
+
+    return {"osv_call_latency_s": round(t1, 3), "mem_sample_bytes": mem_info}
 
 @router.post("/chat")
 async def chat_with_agent(req: ChatRequest):
