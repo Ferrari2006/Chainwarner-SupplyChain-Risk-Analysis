@@ -43,3 +43,4 @@ Thumbs.db
 
 # Cache
 analysis_cache.json
+analysis_cache_v*.json

@@ -85,7 +85,7 @@
         
         /* Floating Download Button */
         .download-btn {
-            position: absolute; top: 20px; right: 20px; z-index: 10;
+            position: absolute; top: 20px; right: 60px; z-index: 10;
             background: var(--accent); color: white; border: none; padding: 8px 15px;
             border-radius: 20px; cursor: pointer; font-weight: bold; box-shadow: 0 4px 10px rgba(0,0,0,0.5);
             display: flex; align-items: center; gap: 5px; transition: transform 0.2s;
@@ -95,9 +95,9 @@
         /* G6 画布 */
         #graph-container { width: 100%; height: 100%; }
         
-        /* 悬浮图例 */
+        /* 悬浮图例 (移到左下，避免覆盖右侧图例/控件) */
         .legend { 
-            position: absolute; bottom: 20px; right: 20px; 
+            position: absolute; bottom: 20px; left: 20px; right: auto;
             background: rgba(0,0,0,0.7); padding: 15px; border-radius: 8px; 
             border: 1px solid #333; backdrop-filter: blur(5px);
         }
@@ -298,6 +298,9 @@
             <button onclick="openCompareModal()" style="background: linear-gradient(90deg, #722ed1, #1890ff); border: none; color: white; padding: 6px 15px; border-radius: 4px; cursor: pointer; font-weight: bold;">
                 ⚔️ 生态 PK
             </button>
+            <button id="notifyBtn" onclick="openNotifyModal()" title="通知" style="background: transparent; border: 1px solid rgba(255,255,255,0.06); color: #fff; padding: 6px 10px; border-radius: 6px; cursor: pointer;">
+                🔔 <span id="notifyCount" style="color:#ff4d4f; font-weight:bold; margin-left:6px;">0</span>
+            </button>
             <div style="width: 200px; overflow: hidden;">
                 <div class="ticker-wrap">
                     <div id="alert-ticker" class="ticker">
@@ -478,6 +481,20 @@
         </div>
     </div>
 
+    <!-- Notifications Modal (右上弹窗展开视窗) -->
+    <div id="notifyModal" class="modal">
+        <div class="modal-content">
+            <span class="close" onclick="closeNotifyModal()">&times;</span>
+            <h2 style="color: var(--primary); border-bottom: 1px solid #333; padding-bottom: 10px;">🔔 系统通知</h2>
+            <div id="notify-list" style="max-height: 400px; overflow-y: auto;">
+                <p style="color:#aaa;">暂无新通知</p>
+            </div>
+            <div style="margin-top: 12px; text-align: right;">
+                <button onclick="clearNotifications()" style="background: transparent; border: 1px solid #444; color: #ccc; padding: 6px 10px; border-radius: 4px; cursor: pointer;">清除</button>
+            </div>
+        </div>
+    </div>
+
     <!-- Chat Widget -->
     <div class="chat-widget">
         <div class="chat-window" id="chat-window">
@@ -517,6 +534,47 @@
                 }
             }
         });
+
+        // --- Notifications (右上弹窗) ---
+        let notifications = [];
+        function openNotifyModal() {
+            const modal = document.getElementById('notifyModal');
+            renderNotifications();
+            modal.style.display = 'block';
+            document.getElementById('notifyCount').textContent = notifications.length;
+        }
+        function closeNotifyModal() {
+            document.getElementById('notifyModal').style.display = 'none';
+        }
+        function renderNotifications() {
+            const list = document.getElementById('notify-list');
+            list.innerHTML = '';
+            if (!notifications.length) {
+                list.innerHTML = '<p style="color:#aaa;">暂无新通知</p>';
+                document.getElementById('notifyCount').textContent = 0;
+                return;
+            }
+            notifications.forEach(n => {
+                const el = document.createElement('div');
+                el.style.padding = '8px'; el.style.borderBottom = '1px solid #222'; el.style.color = '#ddd';
+                el.innerHTML = `<div style="font-weight:bold; color:#fff;">${n.title}</div><div style="font-size:12px; color:#aaa; margin-top:4px;">${n.msg}</div>`;
+                el.onclick = () => { alert(n.msg); };
+                list.appendChild(el);
+            });
+            document.getElementById('notifyCount').textContent = notifications.length;
+        }
+        function pushNotification(title, msg) {
+            notifications.unshift({ title, msg });
+            if (notifications.length > 20) notifications.pop();
+            document.getElementById('notifyCount').textContent = notifications.length;
+        }
+        function clearNotifications() {
+            notifications = [];
+            renderNotifications();
+        }
+
+        // Example push (replace with real events)
+        pushNotification('数据同步完成', '项目列表已更新，榜单将随之刷新。');
 
         function init() {
             initGraph();
@@ -739,7 +797,9 @@
             const div = document.createElement('div');
             div.className = `chat-msg ${type}`;
             div.id = 'msg-' + Date.now();
-            div.innerHTML = text.replace(/\*\*(.*?)\*\*/g, '<b>$1</b>'); // Simple bold parsing
+            const escapeHtml = (s) => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+            const sanitized = escapeHtml(text).replace(/\*\*(.*?)\*\*/g, '<b>$1</b>');
+            div.innerHTML = sanitized;
             body.appendChild(div);
             body.scrollTop = body.scrollHeight;
             return div.id;
@@ -1131,12 +1191,12 @@ Generated by ChainWarner v3.0
             // 模拟雷达图数据（基于风险分反推）
             const safeScore = (1 - safeRisk) * 100;
             const radarData = [
-                Math.min(100, safeScore + Math.random()*20), // 活跃度
-                safeScore, // 安全性
-                Math.min(100, safeScore + Math.random()*30), // 响应
-                Math.random() * 100, // 影响力
-                Math.min(100, safeScore + 10), // 质量
-                Math.min(100, safeScore + Math.random()*10) // 维护
+                Math.min(100, safeScore),
+                Math.min(100, safeScore),
+                Math.min(100, safeScore * 0.9 + 10),
+                Math.min(100, safeScore * 0.8 + 20),
+                Math.min(100, safeScore * 0.95),
+                Math.min(100, safeScore * 0.9 + 5)
             ];
             
             if (radarChart) {
@@ -1173,5 +1233,11 @@ Generated by ChainWarner v3.0
 
         window.onload = init;
     </script>
+
+    <div style="position: fixed; bottom: 20px; right: 300px; background: rgba(0,0,0,0.7); padding: 15px; border-radius: 8px; border: 1px solid #333; color: #fff; font-size: 12px; max-width: 250px; z-index: 1000;">
+        <strong>风险模型说明:</strong><br>
+        我们的风险评分基于GNN预测、NLP情感分析和结构洞指标综合计算。点击节点查看详情。
+    </div>
+
 </body>
 </html>

@@ -6,8 +6,9 @@ networkx
 httpx
 jinja2
 python-multipart
+numpy
 # torch
 # transformers
-# scikit-learn
-# scipy
+scikit-learn
+scipy
 numpy

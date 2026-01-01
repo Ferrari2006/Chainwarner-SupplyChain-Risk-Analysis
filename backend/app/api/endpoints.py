@@ -131,6 +131,7 @@ PACKAGE_MAP = {
     "markupsafe": "pallets/markupsafe",
     "click": "pallets/click",
     "itsdangerous": "pallets/itsdangerous",
+    "blinker": "pallets-eco/blinker",
     "fastapi": "tiangolo/fastapi",
     "uvicorn": "encode/uvicorn",
     "starlette": "encode/starlette",
@@ -246,6 +247,19 @@ def deterministic_random(seed_str: str) -> float:
 
 @router.get("/graph/{owner}/{repo}", response_model=GraphData)
 async def get_dependency_graph(owner: str, repo: str):
+
+    async def query_osv(package: str, ecosystem: str = 'PyPI') -> int:
+        url = "https://api.osv.dev/v1/query"
+        body = {"package": {"name": package, "ecosystem": ecosystem}}
+        try:
+            async with httpx.AsyncClient() as client:
+                resp = await client.post(url, json=body, timeout=5.0)
+                if resp.status_code == 200:
+                    data = resp.json()
+                    return len(data.get('vulns', []))
+        except:
+            return 0
+        return 0
     """
     Advanced Risk Analysis Endpoint (Optimized):
     1. Fetches real OpenDigger data using STREAMING (Memory Friendly).
@@ -279,6 +293,7 @@ async def get_dependency_graph(owner: str, repo: str):
     
     # 100% Real Dependency Fetching
     dependencies = []
+    ecosystem = None
     
     # Try package.json (Node.js)
     # FIX: Try raw.githubusercontent.com again as primary, jsDelivr as fallback
@@ -286,6 +301,7 @@ async def get_dependency_graph(owner: str, repo: str):
     pkg_json = await fetch_repo_file(owner, repo, "package.json")
     if pkg_json:
         dependencies = parse_dependencies(pkg_json, 'json')
+        ecosystem = 'npm'
     else:
         # Try finding in root, if fail, try standard mono-repo paths like "packages/react/package.json"
         # React specific fix: React repo is a monorepo, core is in packages/react
@@ -299,10 +315,12 @@ async def get_dependency_graph(owner: str, repo: str):
             req_txt = await fetch_repo_file(owner, repo, "requirements.txt")
             if req_txt:
                 dependencies = parse_dependencies(req_txt, 'txt')
+                ecosystem = 'PyPI'
             else:
                 # Try pyproject.toml (Python modern) - simplified
                 toml_txt = await fetch_repo_file(owner, repo, "pyproject.toml")
                 if toml_txt:
+                    ecosystem = 'PyPI'
                     # IMPROVED PARSER v2: Handles both PEP 621 (lists) and Poetry (tables)
                     # This fixes the issue where metadata keys (name, version) were mistaken for deps
                     dependencies = []
@@ -381,7 +399,7 @@ async def get_dependency_graph(owner: str, repo: str):
     # Real Data Fetching for Dependencies
     dep_metrics = {}
     
-    async def fetch_dep_metrics(dep_name):
+    async def fetch_dep_metrics(dep_name, ecosystem):
         mapped_name = resolve_repo_name(dep_name)
         # Fetch both metrics in parallel for this dependency
         # IMPORTANT: Use return_exceptions=True to prevent one failure from killing all
@@ -398,27 +416,34 @@ async def get_dependency_graph(owner: str, repo: str):
             # print(f"Failed openrank for {mapped_name}: {d_rank}")
             d_rank = None
             
-        return dep_name, mapped_name, d_act, d_rank
+        cve_count = await query_osv(dep_name, ecosystem) if ecosystem else 0
+        return dep_name, mapped_name, d_act, d_rank, cve_count
 
     # Spawn tasks for all dependencies
     # FIX: Ensure we actually wait for them
     if dependencies:
-        fetch_tasks = [fetch_dep_metrics(d) for d in dependencies]
+        fetch_tasks = [fetch_dep_metrics(d, ecosystem) for d in dependencies]
         results = await asyncio.gather(*fetch_tasks)
-        for dep_name, mapped_name, d_act, d_rank in results:
+        for dep_name, mapped_name, d_act, d_rank, cve_count in results:
             dep_metrics[dep_name] = {
                 "mapped_name": mapped_name,
                 "activity": d_act,
-                "openrank": d_rank
+                "openrank": d_rank,
+                "cve_count": cve_count
             }
 
     # Create topology
     for dep in dependencies:
         metrics = dep_metrics.get(dep)
         
+        # Use mapped name as ID to ensure clickable links work (owner/repo)
+        node_id = metrics['mapped_name'] if metrics else resolve_repo_name(dep)
+        
+        cve_count = metrics.get('cve_count', 0) if metrics else 0
+
         # Calculate Risk based on REAL metrics
         # Default neutral risk if no data found
-        dep_risk = 0.5 
+        dep_risk = 0.5
         dep_openrank = 0
         dep_activity = 0
         
@@ -451,17 +476,17 @@ async def get_dependency_graph(owner: str, repo: str):
             # 60% weight on Rank, 40% on Activity
             # High Rank/Activity -> Low Risk
             dep_risk = 1.0 - (norm_rank * 0.6 + norm_act * 0.4)
-            dep_risk = max(0.05, min(0.95, dep_risk))
-            desc_text = f"Rank: {dep_openrank:.1f} | Risk: {dep_risk * 100:.1f}"
+            dep_risk = max(0.0, min(0.95, dep_risk))
+            desc_text = f"Rank: {dep_openrank:.1f} | CVEs: {cve_count} | Risk: {dep_risk * 100:.1f}"
         else:
             # If no data found in OpenDigger
             # STRICTLY NO RANDOMNESS per user request
-            # Mark as -1 to indicate "Unknown" status explicitly
-            dep_risk = -1.0
-            desc_text = "Data Unavailable (OpenDigger Missing)"
+            # Use neutral base risk to enable topology-based fusion, avoid N/A
+            dep_risk = 0.5
+            desc_text = f"Data Unavailable (OpenDigger Missing) | CVEs: {cve_count} | Using topology fallback"
 
-        nodes_data.append({"id": dep, "risk_score": dep_risk, "type": "Lib", "description": desc_text})
-        edges_data.append({"source": repo_full_name, "target": dep})
+        nodes_data.append({"id": node_id, "risk_score": dep_risk, "type": "Lib", "description": desc_text, "cve_count": cve_count})
+        edges_data.append({"source": repo_full_name, "target": node_id})
         
     # ENRICH TOPOLOGY: Add edges between dependencies to break Star Graph (Constraint=1.0)
     edges_data = enrich_graph_topology(nodes_data, edges_data)
@@ -499,43 +524,27 @@ async def get_dependency_graph(owner: str, repo: str):
         node_obj = next((x for x in nodes_data if x['id'] == n_id), None)
         base_risk = node_obj['risk_score'] if node_obj else 0.5
         
-        # If base_risk is -1 (Unknown), we keep it as -1 to signal frontend
-        if base_risk == -1.0:
-            final_risk = -1.0
-            desc_text = node_obj['description'] if node_obj else "Unknown"
-        else:
-            # 2. Topology Metrics (From EasyGraph)
-            constraint_val = eg_metrics.get('constraint', {}).get(n_id, 0)
-            # Normalize constraint (usually 0-1, but can be higher)
-            score_constraint = min(1.0, constraint_val)
-            
-            betweenness_val = eg_metrics.get('betweenness', {}).get(n_id, 0)
-            # Normalize betweenness (usually small)
-            score_centrality = min(1.0, betweenness_val * 5.0) # Boost for visibility
-
-            # 3. Weighted Fusion Model
-            # Fusion: 70% Base Risk (Data Driven) + 30% Topology (Graph Driven)
-            final_risk = (base_risk * 0.7) + (score_constraint * 0.2) + (score_centrality * 0.1)
-            
-            final_risk = min(1.0, max(0.05, final_risk))
-            desc_text = f"Constraint: {constraint_val:.2f} | Risk: {final_risk * 100:.1f}"
+        # 2. Topology Metrics (From EasyGraph)
+        constraint_val = eg_metrics.get('constraint', {}).get(n_id, 0)
+        # Normalize constraint (usually 0-1, but can be higher)
+        score_constraint = min(1.0, constraint_val)
         
-        # Generate History (Simple fluctuation around the real risk)
+        betweenness_val = eg_metrics.get('betweenness', {}).get(n_id, 0)
+        # Normalize betweenness (usually small)
+        score_centrality = min(1.0, betweenness_val * 5.0) # Boost for visibility
+        cve_count = node_obj.get('cve_count', 0)
+        cve_risk = min(1.0, cve_count * 0.1)
+        # 3. Weighted Fusion Model
+        # Fusion: 60% Base + 20% Constraint + 10% Centrality + 10% CVE
+        final_risk = (base_risk * 0.6) + (score_constraint * 0.2) + (score_centrality * 0.1) + (cve_risk * 0.1)
+        
+        final_risk = min(1.0, max(0.0, final_risk))
+        desc_text = f"Constraint: {constraint_val:.2f} | CVEs: {cve_count} | Risk: {final_risk * 100:.1f}"
+        
+        # Generate History (Deterministic: flat series based on final risk)
         history = []
-        # If unknown, history is flat zero
-        if final_risk == -1.0:
-            history = [0] * 6
-        else:
-            current = final_risk
-            # DETERMINISTIC History (Re-introduced for UI stability, but based on real risk)
-            # Use zlib hash of name to seed the fluctuation pattern
-            h_seed = deterministic_hash(n_id)
-            for k in range(6):
-                history.insert(0, float(f"{current * 100:.1f}"))
-                # Pseudo-random fluctuation
-                fluctuation = ((h_seed + k) % 100 - 50) / 1000.0 # -0.05 to +0.05
-                current = current + fluctuation
-                current = min(1.0, max(0.0, current))
+        for _ in range(6):
+            history.insert(0, float(f"{final_risk * 100:.1f}"))
 
         final_nodes.append(Node(
             id=n_id,
@@ -634,6 +643,7 @@ async def get_leaderboard():
             current_critical_values = [x['risk'] for x in critical_map.values()]
             min_critical_risk = min(current_critical_values) if len(current_critical_values) >= 15 else 0
             
+            # Filter out -100.0 (Unknown) and low risks
             if node_risk_percent > 60.0 and node.id not in critical_map: 
                 # Only add if it qualifies or list is not full
                 if len(critical_map) < 15 or node_risk_percent > min_critical_risk:
@@ -649,7 +659,8 @@ async def get_leaderboard():
             current_star_values = [x['risk'] for x in stars_map.values()]
             max_star_risk = max(current_star_values) if len(current_star_values) >= 15 else 100
             
-            if node_risk_percent <= 40.0 and node.id not in stars_map: 
+            # Filter out -100.0 (Unknown) which is mathematically <= 40.0 but shouldn't be here
+            if node_risk_percent >= 0.0 and node_risk_percent <= 40.0 and node.id not in stars_map: 
                  # Only add if it qualifies or list is not full
                  if len(stars_map) < 15 or node_risk_percent < max_star_risk:
                     stars_map[node.id] = {
@@ -752,3 +763,5 @@ async def compare_projects(owner1: str, repo1: str, owner2: str, repo2: str):
             "activity": list(r2_act.values())[-1] if r2_act else 0
         }
     }
+
+
