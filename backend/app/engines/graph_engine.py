@@ -31,34 +31,40 @@ class GraphEngine:
         # 1. Structural Holes (Burt's Constraint)
         # Identifies brokers who connect otherwise disconnected communities.
         try:
-            # Try EasyGraph first
-            if USE_EASYGRAPH:
-                # EasyGraph constraint might return NaN for disconnected nodes or small graphs
-                constraint = eg.constraint(self.G)
-                # Fill missing/NaN values
-                all_nodes = list(self.G.nodes)
-                for n in all_nodes:
-                    if n not in constraint or constraint[n] != constraint[n]: # Check for NaN
-                        # Fallback heuristic: High degree ~ High constraint
-                        deg = self.G.degree(n)
-                        max_deg = len(self.G) - 1
-                        val = (deg / max_deg) if max_deg > 0 else 0.0
-                        constraint[n] = val
-                metrics['constraint'] = constraint
-            else:
-                # Use NetworkX directly if EasyGraph is missing
+            # Compute constraint on an undirected copy (NetworkX) to avoid
+            # directed/disconnected artifacts and keep results consistent.
+            try:
                 import networkx as nx
-                metrics['constraint'] = nx.constraint(self.G)
-                
-                # NetworkX constraint also returns NaN for isolated/leaf nodes
-                # We need to sanitize this just like we did for EasyGraph
-                for n, val in metrics['constraint'].items():
-                    if val != val: # Check for NaN
-                         # Fallback heuristic: High degree ~ High constraint
-                        deg = self.G.degree(n)
-                        max_deg = len(self.G) - 1
-                        val = (deg / max_deg) if max_deg > 0 else 0.0
-                        metrics['constraint'][n] = val
+                nx_g = nx.Graph()
+                nx_g.add_nodes_from(list(self.G.nodes))
+                # Add edges as undirected (only unique pairs)
+                try:
+                    edges_iter = self.G.edges
+                except:
+                    edges_iter = []
+                for u, v in edges_iter:
+                    try:
+                        nx_g.add_edge(u, v)
+                    except:
+                        pass
+
+                raw_constraint = nx.constraint(nx_g)
+                # Log raw constraint for debugging (can be removed later)
+                print("[graph_engine] raw_constraint sample:", dict(list(raw_constraint.items())[:5]))
+
+                # Sanitize NaN or missing values with degree-based heuristic
+                for n in nx_g.nodes():
+                    val = raw_constraint.get(n, None)
+                    if val is None or (isinstance(val, float) and val != val):
+                        deg = nx_g.degree(n)
+                        max_deg = max(1, nx_g.number_of_nodes() - 1)
+                        raw_constraint[n] = (deg / max_deg) if max_deg > 0 else 0.0
+
+                metrics['constraint'] = raw_constraint
+            except Exception as e:
+                print(f"Constraint (NetworkX) calculation failed, falling back: {e}")
+                # Fallback: Degree Centrality as a proxy
+                metrics['constraint'] = {n: (self.G.degree(n) / max(1, len(self.G) - 1)) for n in self.G.nodes}
         except Exception as e:
             print(f"EasyGraph/NetworkX constraint failed: {e}")
             # Fallback: Degree Centrality as a proxy

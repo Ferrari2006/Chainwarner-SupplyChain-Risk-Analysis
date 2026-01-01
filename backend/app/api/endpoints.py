@@ -195,11 +195,26 @@ def enrich_graph_topology(nodes, edges):
     # Create maps for lookup:
     # full_map: lower_case_full_id -> original full id (e.g. 'tiangolo/fastapi')
     # base_map: lower_case_base_name -> list of full ids that end with that base (e.g. 'fastapi' -> ['tiangolo/fastapi'])
+    import re
+
+    def normalize(name: str) -> str:
+        s = name.lower()
+        # Keep only alphanum for matching, drop common numeric suffixes
+        s = re.sub(r'[^a-z0-9]', '', s)
+        # Remove trailing digits (versions) if present
+        s = re.sub(r'\d+$', '', s)
+        return s
+
     full_map = {n['id'].lower(): n['id'] for n in nodes}
     base_map = {}
     for n in nodes:
         base = n['id'].split('/')[-1].lower()
         base_map.setdefault(base, []).append(n['id'])
+    # Build normalized map for fuzzy matching
+    norm_base_map = {}
+    for base_name, ids in base_map.items():
+        norm = normalize(base_name)
+        norm_base_map.setdefault(norm, []).extend(ids)
     
     extra_edges = []
     
@@ -209,11 +224,23 @@ def enrich_graph_topology(nodes, edges):
         targets = ECOSYSTEM_RELATIONS.get(src_base, [])
         for tgt in targets:
             tgt_lower = tgt.lower()
-            # If we have any node whose base name matches target, link to each of them
+            # 1) Exact base match
+            matched = set()
             if tgt_lower in base_map:
-                for real_tgt in base_map[tgt_lower]:
-                    if real_tgt != src_full and not any(e['source'] == src_full and e['target'] == real_tgt for e in edges):
-                        extra_edges.append({"source": src_full, "target": real_tgt})
+                matched.update(base_map[tgt_lower])
+            # 2) Normalized fuzzy match: substring/startswith
+            tgt_norm = normalize(tgt_lower)
+            for norm_key, ids in norm_base_map.items():
+                if tgt_norm and (norm_key == tgt_norm or norm_key.startswith(tgt_norm) or tgt_norm.startswith(norm_key) or tgt_norm in norm_key or norm_key in tgt_norm):
+                    matched.update(ids)
+            # 3) Full repo name contains check (owner or repo part)
+            for full_lower, real_id in full_map.items():
+                if tgt_lower in full_lower or tgt_norm in normalize(full_lower.split('/')[-1]):
+                    matched.add(real_id)
+
+            for real_tgt in matched:
+                if real_tgt != src_full and not any(e['source'] == src_full and e['target'] == real_tgt for e in edges):
+                    extra_edges.append({"source": src_full, "target": real_tgt})
 
     # 2. Ecosystem Cluster Linking (Sibling <-> Sibling)
     # This creates triangles and lowers constraint
@@ -222,8 +249,15 @@ def enrich_graph_topology(nodes, edges):
         present_members = []
         for m in group["members"]:
             m_lower = m.lower()
+            # Try exact base match
             if m_lower in base_map:
                 present_members.extend(base_map[m_lower])
+            else:
+                # Try normalized fuzzy matches
+                m_norm = normalize(m_lower)
+                for norm_key, ids in norm_base_map.items():
+                    if m_norm and (norm_key == m_norm or norm_key.startswith(m_norm) or m_norm in norm_key):
+                        present_members.extend(ids)
         
         # If 2 or more members exist, link them sequentially or fully
         # Let's link them in a ring to avoid too many edges but create loops
@@ -238,7 +272,17 @@ def enrich_graph_topology(nodes, edges):
                     extra_edges.append({"source": src, "target": tgt})
 
     edges.extend(extra_edges)
-    return edges
+
+    # Deduplicate edges while preserving order
+    seen = set()
+    deduped = []
+    for e in edges:
+        key = (e.get('source'), e.get('target'))
+        if key not in seen:
+            seen.add(key)
+            deduped.append(e)
+
+    return deduped
 
 def resolve_repo_name(pkg_name: str) -> str:
     """Try to map a package name to a GitHub repo owner/name."""
