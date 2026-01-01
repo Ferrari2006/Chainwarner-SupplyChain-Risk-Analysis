@@ -149,6 +149,60 @@ PACKAGE_MAP = {
     "express": "expressjs/express"
 }
 
+# Known Inter-Dependency Relations to break Star Graph (Constraint=1.0)
+# This adds realism by linking dependencies to each other, not just the root.
+ECOSYSTEM_RELATIONS = {
+    # Python
+    "jinja2": ["markupsafe"],
+    "flask": ["werkzeug", "jinja2", "itsdangerous", "click"], # Should match main deps
+    "pandas": ["numpy", "python-dateutil", "pytz"],
+    "scikit-learn": ["numpy", "scipy", "joblib", "threadpoolctl"],
+    "matplotlib": ["numpy", "pillow", "cycler", "kiwisolver", "pyparsing"],
+    "scipy": ["numpy"],
+    "seaborn": ["matplotlib", "numpy", "pandas"],
+    "requests": ["urllib3", "idna", "certifi", "charset-normalizer"],
+    "sqlalchemy": ["greenlet"],
+    "fastapi": ["starlette", "pydantic"],
+    "uvicorn": ["click", "h11"],
+    "starlette": ["anyio"],
+    
+    # JS
+    "react-dom": ["react", "scheduler"],
+    "react": ["loose-envify", "object-assign", "prop-types"],
+    "next": ["react", "react-dom", "styled-jsx"],
+    "antd": ["react", "react-dom", "moment", "lodash"],
+    "jest": ["jest-cli"],
+    "webpack": ["webpack-sources", "webpack-cli"]
+}
+
+def enrich_graph_topology(nodes, edges):
+    """
+    Add edges between existing nodes based on known ecosystem relations.
+    This reduces Burt's Constraint from 1.0 (Star Graph) to realistic values.
+    """
+    # Create a set of existing node IDs for fast lookup
+    node_ids = set(n['id'] for n in nodes)
+    
+    # Check each node to see if it implies other nodes
+    extra_edges = []
+    for node in nodes:
+        src = node['id']
+        # Look up known children
+        # Handle simple name match or mapped name? 
+        # Our nodes use 'dep' name from package.json (e.g. "jinja2")
+        targets = ECOSYSTEM_RELATIONS.get(src.lower(), [])
+        
+        for tgt in targets:
+            if tgt in node_ids and tgt != src:
+                # Avoid duplicate edges
+                # Check if edge already exists? (O(N^2) but N is small < 20)
+                exists = any(e['source'] == src and e['target'] == tgt for e in edges)
+                if not exists:
+                    extra_edges.append({"source": src, "target": tgt})
+    
+    edges.extend(extra_edges)
+    return edges
+
 def resolve_repo_name(pkg_name: str) -> str:
     """Try to map a package name to a GitHub repo owner/name."""
     if "/" in pkg_name:
@@ -272,7 +326,6 @@ async def get_dependency_graph(owner: str, repo: str):
                     # Try CMakeLists.txt (C/C++) - simplified parsing
                     cmake_txt = await fetch_repo_file(owner, repo, "CMakeLists.txt")
                     if cmake_txt:
-                        import re
                         # Look for find_package(PackageName)
                         dependencies = re.findall(r'find_package\s*\(\s*([a-zA-Z0-9_]+)', cmake_txt, re.IGNORECASE)
                     else:
@@ -280,7 +333,6 @@ async def get_dependency_graph(owner: str, repo: str):
                         makefile_txt = await fetch_repo_file(owner, repo, "Makefile")
                         if makefile_txt:
                              # Look for -lLibName (linker flags)
-                             import re
                              dependencies = re.findall(r'-l([a-zA-Z0-9_]+)', makefile_txt)
     
     # Fallback for C/C++ Projects (like Linux, OpenSSL) or unknown structures
@@ -385,6 +437,9 @@ async def get_dependency_graph(owner: str, repo: str):
         nodes_data.append({"id": dep, "risk_score": dep_risk, "type": "Lib", "description": desc_text})
         edges_data.append({"source": repo_full_name, "target": dep})
         
+    # ENRICH TOPOLOGY: Add edges between dependencies to break Star Graph (Constraint=1.0)
+    edges_data = enrich_graph_topology(nodes_data, edges_data)
+
     # Load into Graph Engine
     # IMPORTANT: Must build graph BEFORE calculating metrics
     if len(nodes_data) > 1:
