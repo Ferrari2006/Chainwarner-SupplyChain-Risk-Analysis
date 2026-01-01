@@ -103,31 +103,49 @@ def parse_dependencies(content: str, fmt: str) -> List[str]:
 
 # Common Package to Repo Mapping (Heuristic for Demo)
 PACKAGE_MAP = {
+    # JavaScript / React Ecosystem
     "react": "facebook/react",
     "react-dom": "facebook/react",
-    "scheduler": "facebook/react", # Monorepo
+    "scheduler": "facebook/react",
     "prop-types": "facebook/prop-types",
-    "loose-envify": "manfredsteyer/ngx-build-plus", # Approximation or use a known mirror
+    "loose-envify": "manfredsteyer/ngx-build-plus", 
     "object-assign": "sindresorhus/object-assign",
     "vue": "vuejs/vue",
     "next": "vercel/next.js",
-    "fastapi": "tiangolo/fastapi",
-    "uvicorn": "encode/uvicorn",
-    "pydantic": "pydantic/pydantic",
-    "sqlalchemy": "sqlalchemy/sqlalchemy",
-    "requests": "psf/requests",
-    "numpy": "numpy/numpy",
-    "pandas": "pandas-dev/pandas",
-    "tensorflow": "tensorflow/tensorflow",
-    "pytorch": "pytorch/pytorch",
-    "flask": "pallets/flask",
-    "django": "django/django",
-    "express": "expressjs/express",
     "lodash": "lodash/lodash",
     "axios": "axios/axios",
     "moment": "moment/moment",
     "three": "mrdoob/three.js",
-    "antd": "ant-design/ant-design"
+    "antd": "ant-design/ant-design",
+    "tslib": "microsoft/tslib",
+    "classnames": "JedWatson/classnames",
+    "debug": "debug-js/debug",
+    "ms": "vercel/ms",
+    "inherits": "isaacs/inherits",
+    
+    # Python / Flask / Data Science Ecosystem
+    "flask": "pallets/flask",
+    "werkzeug": "pallets/werkzeug",
+    "jinja2": "pallets/jinja",
+    "markupsafe": "pallets/markupsafe",
+    "click": "pallets/click",
+    "itsdangerous": "pallets/itsdangerous",
+    "fastapi": "tiangolo/fastapi",
+    "uvicorn": "encode/uvicorn",
+    "starlette": "encode/starlette",
+    "pydantic": "pydantic/pydantic",
+    "sqlalchemy": "sqlalchemy/sqlalchemy",
+    "requests": "psf/requests",
+    "urllib3": "urllib3/urllib3",
+    "certifi": "certifi/python-certifi",
+    "idna": "kjd/idna",
+    "charset-normalizer": "Ousret/charset_normalizer",
+    "numpy": "numpy/numpy",
+    "pandas": "pandas-dev/pandas",
+    "tensorflow": "tensorflow/tensorflow",
+    "pytorch": "pytorch/pytorch",
+    "django": "django/django",
+    "express": "expressjs/express"
 }
 
 def resolve_repo_name(pkg_name: str) -> str:
