@@ -366,27 +366,6 @@ async def get_leaderboard():
     cached_items = list(ANALYSIS_CACHE.items())
     recent_items = list(reversed(cached_items))[:10]
     
-    for repo_name, graph_data in recent_items: 
-        # Find root node
-        root = next((n for n in graph_data.nodes if n.id == repo_name), None)
-        if root:
-            # Inject High Risk into Critical List
-            # FIX: Lower threshold to ensure visibility (e.g. > 0.5)
-            if root.risk_score > 0.5:
-                if not any(item['name'] == repo_name for item in critical_list):
-                    critical_list.append({
-                        "rank": 99, 
-                        "name": repo_name,
-                        "risk": round(root.risk_score * 100, 1),
-                        "reason": "Recently Analyzed"
-                    })
-            
-            # Inject Low Risk into Stars List
-            # FIX: Cover the remaining range (<= 0.5) so nothing is lost
-            else: 
-                # Define stars_list reference to modify it below
-                pass # Logic handled in next block to avoid scope issues
-    
     stars_list = [
         {"rank": 1, "name": "torvalds/linux", "risk": 5.2, "reason": "Extremely Active Audit"},
         {"rank": 2, "name": "kubernetes/kubernetes", "risk": 8.1, "reason": "CNCF Graduated"},
@@ -404,6 +383,29 @@ async def get_leaderboard():
         {"rank": 14, "name": "nestjs/nest", "risk": 35.5, "reason": "Enterprise Grade"},
         {"rank": 15, "name": "ant-design/ant-design", "risk": 36.8, "reason": "Consistent Quality"}
     ]
+
+    for repo_name, graph_data in recent_items: 
+        # Iterate through ALL nodes in the graph (Root + Dependencies)
+        for node in graph_data.nodes:
+            # Inject High Risk into Critical List
+            if node.risk_score > 0.6: # High threshold for dependencies
+                if not any(item['name'] == node.id for item in critical_list):
+                    critical_list.append({
+                        "rank": 99, 
+                        "name": node.id,
+                        "risk": round(node.risk_score * 100, 1),
+                        "reason": "Dep Risk Detected" if node.id != repo_name else "Analyzed Project"
+                    })
+            
+            # Inject Low Risk into Stars List
+            elif node.risk_score <= 0.4: 
+                 if not any(item['name'] == node.id for item in stars_list):
+                    stars_list.append({
+                        "rank": 99,
+                        "name": node.id,
+                        "risk": round(node.risk_score * 100, 1),
+                        "reason": "Safe Dependency" if node.id != repo_name else "Safe Architecture"
+                    })
 
     # Inject Low Risk Cache into Stars List
     for repo_name, graph_data in recent_items:
