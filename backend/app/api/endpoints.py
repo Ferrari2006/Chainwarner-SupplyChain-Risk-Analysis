@@ -192,28 +192,38 @@ def enrich_graph_topology(nodes, edges):
     Add edges between existing nodes based on known ecosystem relations.
     This reduces Burt's Constraint from 1.0 (Star Graph) to realistic values.
     """
-    # Create a set of existing node IDs for fast lookup (Lower Case map)
-    # Map: lower_case_id -> original_id
-    node_map = {n['id'].lower(): n['id'] for n in nodes}
+    # Create maps for lookup:
+    # full_map: lower_case_full_id -> original full id (e.g. 'tiangolo/fastapi')
+    # base_map: lower_case_base_name -> list of full ids that end with that base (e.g. 'fastapi' -> ['tiangolo/fastapi'])
+    full_map = {n['id'].lower(): n['id'] for n in nodes}
+    base_map = {}
+    for n in nodes:
+        base = n['id'].split('/')[-1].lower()
+        base_map.setdefault(base, []).append(n['id'])
     
     extra_edges = []
     
     # 1. Direct Relations (Parent -> Child)
-    for src_id in node_map.values():
-        targets = ECOSYSTEM_RELATIONS.get(src_id.lower(), [])
+    for src_full in full_map.values():
+        src_base = src_full.split('/')[-1].lower()
+        targets = ECOSYSTEM_RELATIONS.get(src_base, [])
         for tgt in targets:
             tgt_lower = tgt.lower()
-            if tgt_lower in node_map and node_map[tgt_lower] != src_id:
-                real_tgt = node_map[tgt_lower]
-                # Check exist
-                if not any(e['source'] == src_id and e['target'] == real_tgt for e in edges):
-                     extra_edges.append({"source": src_id, "target": real_tgt})
+            # If we have any node whose base name matches target, link to each of them
+            if tgt_lower in base_map:
+                for real_tgt in base_map[tgt_lower]:
+                    if real_tgt != src_full and not any(e['source'] == src_full and e['target'] == real_tgt for e in edges):
+                        extra_edges.append({"source": src_full, "target": real_tgt})
 
     # 2. Ecosystem Cluster Linking (Sibling <-> Sibling)
     # This creates triangles and lowers constraint
     for group in ECOSYSTEM_GROUPS:
-        # Find members present in current graph
-        present_members = [node_map[m] for m in group["members"] if m in node_map]
+        # Find members present in current graph by base name
+        present_members = []
+        for m in group["members"]:
+            m_lower = m.lower()
+            if m_lower in base_map:
+                present_members.extend(base_map[m_lower])
         
         # If 2 or more members exist, link them sequentially or fully
         # Let's link them in a ring to avoid too many edges but create loops
