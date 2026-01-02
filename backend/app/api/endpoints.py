@@ -627,9 +627,10 @@ async def get_dependency_graph(owner: str, repo: str):
             norm_act = min(1.0, curr_act / max_act)
             
             # Risk is inverse of health
-            # 60% weight on Rank, 40% on Activity
-            # High Rank/Activity -> Low Risk
-            dep_risk = 1.0 - (norm_rank * 0.6 + norm_act * 0.4)
+            # V3 Algo Update: Weight Activity higher (70%) to penalize legacy/maintained-mode projects
+            # 30% weight on Rank, 70% on Activity
+            # High Rank + Low Activity (Legacy) -> High Risk
+            dep_risk = 1.0 - (norm_rank * 0.3 + norm_act * 0.7)
             dep_risk = max(0.0, min(0.95, dep_risk))
             desc_text = f"Rank: {dep_openrank:.1f} | CVEs: {cve_count} | Risk: {dep_risk * 100:.1f}"
         else:
@@ -898,8 +899,9 @@ async def compare_projects(
             n_rank = min(rank_val / 100.0, 1.0) # Normalize rank (100 is high)
             n_cve = min(cve_count / 10.0, 1.0)
             
-            base_risk = 0.6 # Higher base risk
-            risk = base_risk - (n_act * 0.3) - (n_rank * 0.2) + (n_cve * 0.3)
+            # V3 Algo: Activity (0.5) > Rank (0.2) for risk reduction
+            base_risk = 0.8 # Higher base to ensure inactive projects stay high risk
+            risk = base_risk - (n_act * 0.5) - (n_rank * 0.2) + (n_cve * 0.2)
             risk = max(0.0, min(1.0, risk))
             
             return {
@@ -983,23 +985,27 @@ async def get_leaderboard():
     Returns curated lists of projects for the dashboard.
     Dynamically mixes in cached recent searches to make the leaderboard feel "alive".
     """
-    # Base Leaderboard (Curated)
+    # Base Leaderboard (Curated & Aligned with V3 Algorithm)
+    # V3 Algo: High Activity -> Low Base Risk.
+    # So active projects (React, Vue, Django) should have low risk (10-30%) even with some CVEs.
+    # Legacy/Inactive projects with CVEs will have high risk (70-90%).
+    
     critical_list = [
-        {"rank": 1, "name": "apache/struts", "risk": 95.2, "reason": "High Vulnerability Count"},
-        {"rank": 2, "name": "fastjson/fastjson", "risk": 92.8, "reason": "Frequent RCE Exploits"},
-        {"rank": 3, "name": "log4j/log4j2", "risk": 88.5, "reason": "Critical Legacy Issues"},
-        {"rank": 4, "name": "openssl/openssl", "risk": 85.1, "reason": "Heartbleed History"},
-        {"rank": 5, "name": "jenkins/jenkins", "risk": 82.4, "reason": "Plugin Security Risks"},
-        {"rank": 6, "name": "struts/struts2", "risk": 80.9, "reason": "Old Vulnerabilities"},
-        {"rank": 7, "name": "spring/spring-framework", "risk": 78.3, "reason": "Complex Dependencies"},
-        {"rank": 8, "name": "axios/axios", "risk": 75.6, "reason": "SSRF Risks"},
-        {"rank": 9, "name": "lodash/lodash", "risk": 72.1, "reason": "Prototype Pollution"},
-        {"rank": 10, "name": "moment/moment", "risk": 70.8, "reason": "Maintenance Mode"},
-        {"rank": 11, "name": "express/express", "risk": 68.4, "reason": "Middleware Risks"},
-        {"rank": 12, "name": "vuejs/vue", "risk": 65.7, "reason": "XSS Vectors"},
-        {"rank": 13, "name": "angular/angular", "risk": 62.3, "reason": "Complexity"},
-        {"rank": 14, "name": "django/django", "risk": 60.5, "reason": "SQL Injection History"},
-        {"rank": 15, "name": "flask/flask", "risk": 58.9, "reason": "Debug Mode Risks"}
+        {"rank": 1, "name": "apache/struts", "risk": 85.2, "reason": "High Vulnerability Count"},
+        {"rank": 2, "name": "fastjson/fastjson", "risk": 82.8, "reason": "Frequent RCE Exploits"},
+        {"rank": 3, "name": "log4j/log4j2", "risk": 78.5, "reason": "Critical Legacy Issues"},
+        {"rank": 4, "name": "openssl/openssl", "risk": 75.1, "reason": "Heartbleed History"},
+        {"rank": 5, "name": "jenkins/jenkins", "risk": 72.4, "reason": "Plugin Security Risks"},
+        {"rank": 6, "name": "struts/struts2", "risk": 70.9, "reason": "Old Vulnerabilities"},
+        {"rank": 7, "name": "spring/spring-framework", "risk": 68.3, "reason": "Complex Dependencies"},
+        {"rank": 8, "name": "axios/axios", "risk": 65.6, "reason": "SSRF Risks"},
+        {"rank": 9, "name": "lodash/lodash", "risk": 62.1, "reason": "Prototype Pollution"},
+        {"rank": 10, "name": "moment/moment", "risk": 60.8, "reason": "Maintenance Mode"},
+        {"rank": 11, "name": "express/express", "risk": 58.4, "reason": "Middleware Risks"},
+        {"rank": 12, "name": "vuejs/vue", "risk": 25.7, "reason": "XSS Vectors (Active)"},
+        {"rank": 13, "name": "angular/angular", "risk": 22.3, "reason": "Complexity (Active)"},
+        {"rank": 14, "name": "django/django", "risk": 20.5, "reason": "SQL Injection History (Active)"},
+        {"rank": 15, "name": "flask/flask", "risk": 18.9, "reason": "Debug Mode Risks (Active)"}
     ]
     
     # Try to inject recently analyzed high-risk projects from cache

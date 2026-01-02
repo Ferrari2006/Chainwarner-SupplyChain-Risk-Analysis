@@ -11,4 +11,3 @@ numpy
 # transformers
 scikit-learn
 scipy
-numpy
