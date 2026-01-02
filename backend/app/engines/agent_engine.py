@@ -1,5 +1,4 @@
 import os
-import random
 import httpx
 import json
 
@@ -155,21 +154,21 @@ class AgentEngine:
         # Intent Routing
         # Use simple keyword matching for Chinese/English
         if any(w in query for w in ["risk", "score", "safe", "status", "风险", "安全", "分数"]):
-            tpl = random.choice(self.templates["RISK_ANALYSIS"])
+            tpl = self.templates["RISK_ANALYSIS"][0]
             return tpl.format(
                 repo_name=repo_name, risk_percent=percent, status=status,
                 driver_factor=driver_factor, implication=implication
             )
             
         elif any(w in query for w in ["rank", "influence", "community", "trend", "排名", "影响", "社区", "趋势"]):
-            tpl = random.choice(self.templates["ECOSYSTEM_INSIGHT"])
+            tpl = self.templates["ECOSYSTEM_INSIGHT"][0]
             return tpl.format(
                 repo_name=repo_name, openrank_val=openrank_val,
                 rank_desc=rank_desc, activity_desc=activity_desc
             )
             
         elif any(w in query for w in ["fix", "advice", "suggestion", "help", "建议", "修复", "怎么办"]):
-            tpl = random.choice(self.templates["SECURITY_ADVICE"])
+            tpl = self.templates["SECURITY_ADVICE"][0]
             return tpl.format(
                 risk_level=risk_level, action=action, focus_area=focus_area
             )

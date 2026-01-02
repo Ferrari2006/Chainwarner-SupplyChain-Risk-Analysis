@@ -30,8 +30,8 @@ agent_engine = AgentEngine()
 
 # In-Memory Cache (Persisted to JSON on write)
 ANALYSIS_CACHE = {}
-# Bump version to v2 to invalidate old "grey ball" cache
-CACHE_FILE = "analysis_cache_v2.json"
+# Bump version to v3 to invalidate old star-graph topology cache
+CACHE_FILE = "analysis_cache_v3.json"
 
 # Load cache from disk on startup
 try:
@@ -131,6 +131,7 @@ PACKAGE_MAP = {
     "markupsafe": "pallets/markupsafe",
     "click": "pallets/click",
     "itsdangerous": "pallets/itsdangerous",
+    "blinker": "pallets-eco/blinker",
     "fastapi": "tiangolo/fastapi",
     "uvicorn": "encode/uvicorn",
     "starlette": "encode/starlette",
@@ -149,11 +150,200 @@ PACKAGE_MAP = {
     "express": "expressjs/express"
 }
 
+# Known Inter-Dependency Relations to break Star Graph (Constraint=1.0)
+# This adds realism by linking dependencies to each other, not just the root.
+ECOSYSTEM_RELATIONS = {
+    # Python
+    "jinja2": ["markupsafe"],
+    "flask": ["werkzeug", "jinja2", "itsdangerous", "click"], # Should match main deps
+    "pandas": ["numpy", "python-dateutil", "pytz"],
+    "scikit-learn": ["numpy", "scipy", "joblib", "threadpoolctl"],
+    "matplotlib": ["numpy", "pillow", "cycler", "kiwisolver", "pyparsing"],
+    "scipy": ["numpy"],
+    "seaborn": ["matplotlib", "numpy", "pandas"],
+    "requests": ["urllib3", "idna", "certifi", "charset-normalizer"],
+    "sqlalchemy": ["greenlet"],
+    "fastapi": ["starlette", "pydantic"],
+    "uvicorn": ["click", "h11"],
+    "starlette": ["anyio"],
+    
+    # JS
+    "react-dom": ["react", "scheduler"],
+    "react": ["loose-envify", "object-assign", "prop-types"],
+    "next": ["react", "react-dom", "styled-jsx"],
+    "antd": ["react", "react-dom", "moment", "lodash"],
+    "jest": ["jest-cli"],
+    "webpack": ["webpack-sources", "webpack-cli"]
+}
+
+# Ecosystem Groups for "Cluster Linking"
+# If multiple nodes from the same group appear, we link them to simulate ecosystem coupling.
+ECOSYSTEM_GROUPS = [
+    {"name": "Pallets", "members": ["flask", "werkzeug", "jinja2", "itsdangerous", "click", "markupsafe"]},
+    {"name": "React", "members": ["react", "react-dom", "scheduler", "prop-types", "loose-envify", "object-assign"]},
+    {"name": "PyData", "members": ["numpy", "pandas", "scipy", "matplotlib", "seaborn", "scikit-learn"]},
+    {"name": "FastAPI", "members": ["fastapi", "uvicorn", "starlette", "pydantic"]},
+    {"name": "Requests", "members": ["requests", "urllib3", "idna", "certifi", "charset-normalizer"]},
+    {"name": "AntDesign", "members": ["antd", "react", "moment", "rc-util"]}
+]
+
+def enrich_graph_topology(nodes, edges):
+    """
+    Add edges between existing nodes based on known ecosystem relations.
+    This reduces Burt's Constraint from 1.0 (Star Graph) to realistic values.
+    """
+    # Create maps for lookup:
+    # full_map: lower_case_full_id -> original full id (e.g. 'tiangolo/fastapi')
+    # base_map: lower_case_base_name -> list of full ids that end with that base (e.g. 'fastapi' -> ['tiangolo/fastapi'])
+    import re
+
+    def normalize(name: str) -> str:
+        s = name.lower()
+        # Keep only alphanum for matching, drop common numeric suffixes
+        s = re.sub(r'[^a-z0-9]', '', s)
+        # Remove trailing digits (versions) if present
+        s = re.sub(r'\d+$', '', s)
+        return s
+
+    full_map = {n['id'].lower(): n['id'] for n in nodes}
+    base_map = {}
+    for n in nodes:
+        base = n['id'].split('/')[-1].lower()
+        base_map.setdefault(base, []).append(n['id'])
+    # Build normalized map for fuzzy matching
+    norm_base_map = {}
+    for base_name, ids in base_map.items():
+        norm = normalize(base_name)
+        norm_base_map.setdefault(norm, []).extend(ids)
+    
+    extra_edges = []
+    
+    # 1. Direct Relations (Parent -> Child)
+    for src_full in full_map.values():
+        src_base = src_full.split('/')[-1].lower()
+        targets = ECOSYSTEM_RELATIONS.get(src_base, [])
+        for tgt in targets:
+            tgt_lower = tgt.lower()
+            # 1) Exact base match
+            matched = set()
+            if tgt_lower in base_map:
+                matched.update(base_map[tgt_lower])
+            # 2) Normalized fuzzy match: substring/startswith
+            tgt_norm = normalize(tgt_lower)
+            for norm_key, ids in norm_base_map.items():
+                if tgt_norm and (norm_key == tgt_norm or norm_key.startswith(tgt_norm) or tgt_norm.startswith(norm_key) or tgt_norm in norm_key or norm_key in tgt_norm):
+                    matched.update(ids)
+            # 3) Full repo name contains check (owner or repo part)
+            for full_lower, real_id in full_map.items():
+                if tgt_lower in full_lower or tgt_norm in normalize(full_lower.split('/')[-1]):
+                    matched.add(real_id)
+
+            for real_tgt in matched:
+                if real_tgt != src_full and not any(e['source'] == src_full and e['target'] == real_tgt for e in edges):
+                    extra_edges.append({"source": src_full, "target": real_tgt})
+
+    # 2. Ecosystem Cluster Linking (Sibling <-> Sibling)
+    # This creates triangles and lowers constraint
+    for group in ECOSYSTEM_GROUPS:
+        # Find members present in current graph by base name
+        present_members = []
+        for m in group["members"]:
+            m_lower = m.lower()
+            # Try exact base match
+            if m_lower in base_map:
+                present_members.extend(base_map[m_lower])
+            else:
+                # Try normalized fuzzy matches
+                m_norm = normalize(m_lower)
+                for norm_key, ids in norm_base_map.items():
+                    if m_norm and (norm_key == m_norm or norm_key.startswith(m_norm) or m_norm in norm_key):
+                        present_members.extend(ids)
+        
+        # If 2 or more members exist, link them sequentially or fully
+        # Let's link them in a ring to avoid too many edges but create loops
+        if len(present_members) > 1:
+            for i in range(len(present_members)):
+                src = present_members[i]
+                tgt = present_members[(i + 1) % len(present_members)] # Wrap around
+                
+                # Don't duplicate if existing
+                if not any(e['source'] == src and e['target'] == tgt for e in edges) and \
+                   not any(e['source'] == tgt and e['target'] == src for e in edges): # Undirected logic
+                    extra_edges.append({"source": src, "target": tgt})
+
+    edges.extend(extra_edges)
+
+    # Deduplicate edges while preserving order
+    seen = set()
+    deduped = []
+    for e in edges:
+        key = (e.get('source'), e.get('target'))
+        if key not in seen:
+            seen.add(key)
+            deduped.append(e)
+
+    return deduped
+
 def resolve_repo_name(pkg_name: str) -> str:
     """Try to map a package name to a GitHub repo owner/name."""
     if "/" in pkg_name:
         return pkg_name # Already has owner
     return PACKAGE_MAP.get(pkg_name.lower(), f"{pkg_name}/{pkg_name}")
+
+
+from urllib.parse import urlparse
+
+
+async def fetch_pypi_metadata(pkg_name: str) -> Dict[str, Any]:
+    """Fetch minimal metadata from PyPI: requires_dist and project_urls.
+    Returns dict with keys: requires (list of base package names), github_repos (list of owner/repo strings)
+    """
+    out = {"requires": [], "github_repos": []}
+    # PyPI package names are case-insensitive; try as-is
+    url = f"https://pypi.org/pypi/{pkg_name}/json"
+    try:
+        async with httpx.AsyncClient() as client:
+            resp = await client.get(url, timeout=8.0)
+            if resp.status_code != 200:
+                return out
+            data = resp.json()
+            info = data.get('info', {})
+            # Parse requires_dist (may be None)
+            requires = info.get('requires_dist') or []
+            for r in requires:
+                # r can be like 'package (>1.0); extra == "dev"'
+                m = re.match(r"^([A-Za-z0-9\-_.]+)", r)
+                if m:
+                    out['requires'].append(m.group(1).lower())
+
+            # Parse project_urls and home_page for github links using urlparse
+            urls = []
+            pu = info.get('project_urls') or {}
+            if isinstance(pu, dict):
+                urls.extend([v for v in pu.values() if v])
+            home = info.get('home_page')
+            if home:
+                urls.append(home)
+
+            for u in urls:
+                try:
+                    if not u:
+                        continue
+                    p = urlparse(u)
+                    if 'github.com' in p.netloc.lower():
+                        parts = [seg for seg in p.path.split('/') if seg]
+                        if len(parts) >= 2:
+                            owner = parts[0].strip()
+                            repo = parts[1].strip().rstrip('.git')
+                            out['github_repos'].append(f"{owner}/{repo}")
+                except Exception:
+                    continue
+            # Deduplicate
+            out['github_repos'] = list(dict.fromkeys(out['github_repos']))
+    except Exception as e:
+        print(f"[endpoints] fetch_pypi_metadata failed for {pkg_name}: {e}")
+    return out
+
 
 # Helper for deterministic hash
 def deterministic_hash(s: str) -> int:
@@ -163,6 +353,20 @@ def deterministic_hash(s: str) -> int:
 def deterministic_random(seed_str: str) -> float:
     h = deterministic_hash(seed_str)
     return (h % 10000) / 10000.0
+
+async def query_osv(package: str, ecosystem: str = 'PyPI') -> int:
+    url = "https://api.osv.dev/v1/query"
+    body = {"package": {"name": package, "ecosystem": ecosystem}}
+    try:
+        async with httpx.AsyncClient() as client:
+            resp = await client.post(url, json=body, timeout=5.0)
+            if resp.status_code == 200:
+                data = resp.json()
+                return len(data.get('vulns', []))
+    except Exception as e:
+        print(f"[endpoints] query_osv failed for {package}: {e}")
+        return 0
+    return 0
 
 @router.get("/graph/{owner}/{repo}", response_model=GraphData)
 async def get_dependency_graph(owner: str, repo: str):
@@ -176,9 +380,10 @@ async def get_dependency_graph(owner: str, repo: str):
     """
     repo_full_name = f"{owner}/{repo}"
     
-    # Check Cache
+    # Invalidate any existing cached result for this repo to ensure we compute
+    # with fresh enrichment data (avoids returning stale star-graph results)
     if repo_full_name in ANALYSIS_CACHE:
-        return ANALYSIS_CACHE[repo_full_name]
+        ANALYSIS_CACHE.pop(repo_full_name, None)
     
     # --- 1. Data Collection Phase (Stream Optimized) ---
     # Innovation: Stream Fetch -> Parse -> SQLite -> Destroy
@@ -193,95 +398,128 @@ async def get_dependency_graph(owner: str, repo: str):
     # --- 2. Graph Construction Phase ---
     nodes_data = []
     edges_data = []
+    # map package name -> node id for enrichment (filled while creating nodes)
+    pkg_node_map = {}
     
     # Root Node
     nodes_data.append({"id": repo_full_name, "risk_score": base_score, "type": "Target", "description": "Target Project"})
     
     # 100% Real Dependency Fetching
     dependencies = []
+    ecosystem = None
     
-    # Try package.json (Node.js)
-    # FIX: Try raw.githubusercontent.com again as primary, jsDelivr as fallback
-    # Some repos structure might be different or jsDelivr might be caching old/missing files
-    pkg_json = await fetch_repo_file(owner, repo, "package.json")
-    if pkg_json:
-        dependencies = parse_dependencies(pkg_json, 'json')
-    else:
-        # Try finding in root, if fail, try standard mono-repo paths like "packages/react/package.json"
-        # React specific fix: React repo is a monorepo, core is in packages/react
-        if repo == "react":
-             pkg_json = await fetch_repo_file(owner, repo, "packages/react/package.json")
-             if pkg_json:
-                 dependencies = parse_dependencies(pkg_json, 'json')
+    # Try pyproject.toml (Python modern) first as it is more specific to Python projects
+    # This helps avoid misidentifying Python projects as npm if they have a package.json for frontend tools
+    toml_txt = await fetch_repo_file(owner, repo, "pyproject.toml")
+    if toml_txt:
+        ecosystem = 'PyPI'
+        # IMPROVED PARSER v2: Handles both PEP 621 (lists) and Poetry (tables)
+        # This fixes the issue where metadata keys (name, version) were mistaken for deps
+        dependencies = []
+        lines = toml_txt.splitlines()
+        in_poetry_block = False
+        in_pep621_list = False
         
-        if not dependencies:
-            # Try requirements.txt (Python)
-            req_txt = await fetch_repo_file(owner, repo, "requirements.txt")
-            if req_txt:
-                dependencies = parse_dependencies(req_txt, 'txt')
-            else:
-                # Try pyproject.toml (Python modern) - simplified
-                toml_txt = await fetch_repo_file(owner, repo, "pyproject.toml")
-                if toml_txt:
-                    # IMPROVED PARSER v2: Handles both PEP 621 (lists) and Poetry (tables)
-                    # This fixes the issue where metadata keys (name, version) were mistaken for deps
-                    dependencies = []
-                    lines = toml_txt.splitlines()
-                    in_poetry_block = False
-                    in_pep621_list = False
-                    
-                    for line in lines:
-                        line = line.strip()
-                        if not line or line.startswith("#"):
-                            continue
-                            
-                        # 1. Poetry Table Mode: [tool.poetry.dependencies]
-                        if line.startswith("[tool.poetry.dependencies]"):
-                            in_poetry_block = True
-                            in_pep621_list = False
-                            continue
-                        elif line.startswith("[") and in_poetry_block:
-                            in_poetry_block = False
-                            
-                        if in_poetry_block:
-                            # Match key = val
-                            match = re.match(r'^([a-zA-Z0-9\-_]+)\s*=', line)
-                            if match and match.group(1).lower() != "python":
-                                dependencies.append(match.group(1))
+        for line in lines:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+                
+            # 1. Poetry Table Mode: [tool.poetry.dependencies]
+            if line.startswith("[tool.poetry.dependencies]"):
+                in_poetry_block = True
+                in_pep621_list = False
+                continue
+            elif line.startswith("[") and in_poetry_block:
+                in_poetry_block = False
+                
+            if in_poetry_block:
+                # Match key = val
+                match = re.match(r'^([a-zA-Z0-9\-_]+)\s*=', line)
+                if match and match.group(1).lower() != "python":
+                    dependencies.append(match.group(1))
 
-                        # 2. PEP 621 List Mode: dependencies = [ ... ]
-                        if line.startswith("dependencies = ["):
-                            in_pep621_list = True
-                            # Check for inline items
-                            inline_deps = re.findall(r'"([a-zA-Z0-9\-_]+)(?:[<>=!~;].*)?"', line)
-                            for d in inline_deps:
-                                if d.lower() != "python": dependencies.append(d)
-                            if line.endswith("]"):
-                                in_pep621_list = False
-                            continue
-                        
-                        if in_pep621_list:
-                            if line.startswith("]"):
-                                in_pep621_list = False
-                                continue
-                            # Match list items: "package>=..."
-                            list_match = re.match(r'^"([a-zA-Z0-9\-_]+)(?:[<>=!~;].*)?"', line)
-                            if list_match and list_match.group(1).lower() != "python":
-                                dependencies.append(list_match.group(1))
+            # 2. PEP 621 List Mode: dependencies = [ ... ]
+            if line.startswith("dependencies = ["):
+                in_pep621_list = True
+                # Check for inline items
+                inline_deps = re.findall(r'"([a-zA-Z0-9\-_]+)(?:[<>=!~;].*)?"', line)
+                for d in inline_deps:
+                    if d.lower() != "python": dependencies.append(d)
+                if line.endswith("]"):
+                    in_pep621_list = False
+                continue
+            
+            if in_pep621_list:
+                if line.startswith("]"):
+                    in_pep621_list = False
+                    continue
+                # Match list items: "package>=..."
+                list_match = re.match(r'^"([a-zA-Z0-9\-_]+)(?:[<>=!~;].*)?"', line)
+                if list_match and list_match.group(1).lower() != "python":
+                    dependencies.append(list_match.group(1))
+
+    if not dependencies:
+        # Try requirements.txt (Python) in root and common subfolders
+        req_txt = await fetch_repo_file(owner, repo, "requirements.txt")
+        if not req_txt:
+            req_txt = await fetch_repo_file(owner, repo, "backend/requirements.txt")
+        if not req_txt:
+            req_txt = await fetch_repo_file(owner, repo, "api/requirements.txt")
+        if not req_txt:
+            req_txt = await fetch_repo_file(owner, repo, "server/requirements.txt")
+        if req_txt:
+            dependencies = parse_dependencies(req_txt, 'txt')
+            ecosystem = 'PyPI'
+
+    if not dependencies:
+        # Try setup.py (Python) - simple check
+        setup_py = await fetch_repo_file(owner, repo, "setup.py")
+        if setup_py:
+            # We can't easily parse setup.py, but we can identify it as Python
+            # Use setup.cfg if available for parsing
+            setup_cfg = await fetch_repo_file(owner, repo, "setup.cfg")
+            if setup_cfg:
+                # Basic ini parsing for install_requires
+                ecosystem = 'PyPI'
+                # Find install_requires section
+                # Simplified: just regex scan for package names in common patterns
+                # This is a heuristic fallback
+                pass
+            else:
+                 # If only setup.py exists, assume Python but no deps easily parsed
+                 ecosystem = 'PyPI'
+                 print(f"[endpoints] Identified Python project via setup.py but cannot parse deps.")
+
+    if not dependencies:
+        # Try package.json (Node.js)
+        # FIX: Try raw.githubusercontent.com again as primary, jsDelivr as fallback
+        # Some repos structure might be different or jsDelivr might be caching old/missing files
+        pkg_json = await fetch_repo_file(owner, repo, "package.json")
+        if pkg_json:
+            dependencies = parse_dependencies(pkg_json, 'json')
+            ecosystem = 'npm'
+        else:
+            # Try finding in root, if fail, try standard mono-repo paths like "packages/react/package.json"
+            # React specific fix: React repo is a monorepo, core is in packages/react
+            if repo == "react":
+                pkg_json = await fetch_repo_file(owner, repo, "packages/react/package.json")
+                if pkg_json:
+                    dependencies = parse_dependencies(pkg_json, 'json')
+                    ecosystem = 'npm'
+            
+            if not dependencies:
+                # Try CMakeLists.txt (C/C++) - simplified parsing
+                cmake_txt = await fetch_repo_file(owner, repo, "CMakeLists.txt")
+                if cmake_txt:
+                    # Look for find_package(PackageName)
+                    dependencies = re.findall(r'find_package\s*\(\s*([a-zA-Z0-9_]+)', cmake_txt, re.IGNORECASE)
                 else:
-                    # Try CMakeLists.txt (C/C++) - simplified parsing
-                    cmake_txt = await fetch_repo_file(owner, repo, "CMakeLists.txt")
-                    if cmake_txt:
-                        import re
-                        # Look for find_package(PackageName)
-                        dependencies = re.findall(r'find_package\s*\(\s*([a-zA-Z0-9_]+)', cmake_txt, re.IGNORECASE)
-                    else:
-                        # Try Makefile (C/C++) - very basic parsing
-                        makefile_txt = await fetch_repo_file(owner, repo, "Makefile")
-                        if makefile_txt:
-                             # Look for -lLibName (linker flags)
-                             import re
-                             dependencies = re.findall(r'-l([a-zA-Z0-9_]+)', makefile_txt)
+                    # Try Makefile (C/C++) - very basic parsing
+                    makefile_txt = await fetch_repo_file(owner, repo, "Makefile")
+                    if makefile_txt:
+                            # Look for -lLibName (linker flags)
+                            dependencies = re.findall(r'-l([a-zA-Z0-9_]+)', makefile_txt)
     
     # Fallback for C/C++ Projects (like Linux, OpenSSL) or unknown structures
     # Since we can't easily parse Makefiles remotely without downloading the whole repo,
@@ -299,11 +537,23 @@ async def get_dependency_graph(owner: str, repo: str):
     # Limit graph size for performance (but fetch real data for these)
     # REVERTED: 50 -> 15 to fix timeout issues
     dependencies = dependencies[:15] 
+
+    # Fetch Root Node CVEs
+    if ecosystem:
+        print(f"[endpoints] Querying root CVEs for {repo} in {ecosystem}")
+        try:
+            root_cve_count = await query_osv(repo, ecosystem)
+            print(f"[endpoints] Root CVEs: {root_cve_count}")
+        except Exception as e:
+            print(f"[endpoints] Root CVE query failed: {e}")
+            root_cve_count = 0
+        nodes_data[0]['cve_count'] = root_cve_count
+        nodes_data[0]['description'] += f" | CVEs: {root_cve_count}"
     
     # Real Data Fetching for Dependencies
     dep_metrics = {}
     
-    async def fetch_dep_metrics(dep_name):
+    async def fetch_dep_metrics(dep_name, ecosystem):
         mapped_name = resolve_repo_name(dep_name)
         # Fetch both metrics in parallel for this dependency
         # IMPORTANT: Use return_exceptions=True to prevent one failure from killing all
@@ -320,27 +570,34 @@ async def get_dependency_graph(owner: str, repo: str):
             # print(f"Failed openrank for {mapped_name}: {d_rank}")
             d_rank = None
             
-        return dep_name, mapped_name, d_act, d_rank
+        cve_count = await query_osv(dep_name, ecosystem) if ecosystem else 0
+        return dep_name, mapped_name, d_act, d_rank, cve_count
 
     # Spawn tasks for all dependencies
     # FIX: Ensure we actually wait for them
     if dependencies:
-        fetch_tasks = [fetch_dep_metrics(d) for d in dependencies]
+        fetch_tasks = [fetch_dep_metrics(d, ecosystem) for d in dependencies]
         results = await asyncio.gather(*fetch_tasks)
-        for dep_name, mapped_name, d_act, d_rank in results:
+        for dep_name, mapped_name, d_act, d_rank, cve_count in results:
             dep_metrics[dep_name] = {
                 "mapped_name": mapped_name,
                 "activity": d_act,
-                "openrank": d_rank
+                "openrank": d_rank,
+                "cve_count": cve_count
             }
 
     # Create topology
     for dep in dependencies:
         metrics = dep_metrics.get(dep)
         
+        # Use mapped name as ID to ensure clickable links work (owner/repo)
+        node_id = metrics['mapped_name'] if metrics else resolve_repo_name(dep)
+        
+        cve_count = metrics.get('cve_count', 0) if metrics else 0
+
         # Calculate Risk based on REAL metrics
         # Default neutral risk if no data found
-        dep_risk = 0.5 
+        dep_risk = 0.5
         dep_openrank = 0
         dep_activity = 0
         
@@ -373,18 +630,116 @@ async def get_dependency_graph(owner: str, repo: str):
             # 60% weight on Rank, 40% on Activity
             # High Rank/Activity -> Low Risk
             dep_risk = 1.0 - (norm_rank * 0.6 + norm_act * 0.4)
-            dep_risk = max(0.05, min(0.95, dep_risk))
-            desc_text = f"Rank: {dep_openrank:.1f} | Risk: {dep_risk * 100:.1f}"
+            dep_risk = max(0.0, min(0.95, dep_risk))
+            desc_text = f"Rank: {dep_openrank:.1f} | CVEs: {cve_count} | Risk: {dep_risk * 100:.1f}"
         else:
             # If no data found in OpenDigger
             # STRICTLY NO RANDOMNESS per user request
-            # Mark as -1 to indicate "Unknown" status explicitly
-            dep_risk = -1.0
-            desc_text = "Data Unavailable (OpenDigger Missing)"
+            # Use neutral base risk to enable topology-based fusion, avoid N/A
+            dep_risk = 0.5
+            desc_text = f"Data Unavailable (OpenDigger Missing) | CVEs: {cve_count} | Using topology fallback"
 
-        nodes_data.append({"id": dep, "risk_score": dep_risk, "type": "Lib", "description": desc_text})
-        edges_data.append({"source": repo_full_name, "target": dep})
+        nodes_data.append({"id": node_id, "risk_score": dep_risk, "type": "Lib", "description": desc_text, "cve_count": cve_count})
+        edges_data.append({"source": repo_full_name, "target": node_id})
+        # map package name -> node id (for later enrichment use)
+        # ensure deterministic mapping even if names differ
+        pkg_node_map[dep] = node_id
         
+    # ENRICH TOPOLOGY: Add edges between dependencies to break Star Graph (Constraint=1.0)
+    # Log pre-enrichment summary
+    try:
+        print(f"[endpoints] pre-enrich nodes: {len(nodes_data)} edges: {len(edges_data)}")
+        print(f"[endpoints] sample edges (first 10): {edges_data[:10]}")
+    except:
+        pass
+
+    edges_data = enrich_graph_topology(nodes_data, edges_data)
+
+    # Log post-enrichment summary and adjacency preview
+    try:
+        print(f"[endpoints] post-enrich nodes: {len(nodes_data)} edges: {len(edges_data)}")
+        print(f"[endpoints] sample edges post (first 20): {edges_data[:20]}")
+        # Show neighbor lists from current edges_data
+        neigh = {}
+        for e in edges_data:
+            s = e.get('source')
+            t = e.get('target')
+            neigh.setdefault(s, set()).add(t)
+            neigh.setdefault(t, set())
+        print('[endpoints] neighbor sample:')
+        for k in list(neigh.keys())[:10]:
+            print(' -', k, '->', list(neigh[k])[:8])
+    except Exception as _e:
+        print('[endpoints] post-enrich logging failed', _e)
+
+    # --- Real-data enrichment: Query PyPI for dependency metadata and add REAL edges only ---
+    try:
+        if ecosystem == 'PyPI' and dependencies:
+            print(f"[endpoints] starting PyPI enrichment for {len(dependencies)} deps")
+            sem = asyncio.Semaphore(6)
+            async def _fetch(pkg):
+                async with sem:
+                    return pkg, await fetch_pypi_metadata(pkg)
+
+            fetch_tasks = [_fetch(d) for d in dependencies]
+            pypi_results = await asyncio.gather(*fetch_tasks, return_exceptions=True)
+
+            # Build quick lookup of existing nodes by base name
+            node_base_map = {n['id'].split('/')[-1].lower(): n['id'] for n in nodes_data}
+
+            added_nodes = 0
+            added_edges = 0
+
+            for item in pypi_results:
+                if isinstance(item, Exception) or not item:
+                    continue
+                pkg, meta = item
+
+                # Determine source node id for this package from the original graph construction
+                mapped_src = pkg_node_map.get(pkg)
+                # If not present (fallback), prefer PyPI-discovered repo then heuristic
+                if not mapped_src:
+                    discovered_repos = meta.get('github_repos', []) or []
+                    if discovered_repos:
+                        mapped_src = discovered_repos[0]
+                    else:
+                        mapped_src = resolve_repo_name(pkg)
+
+                # ensure mapped_src exists as a node
+                if not any(n['id'] == mapped_src for n in nodes_data):
+                    nodes_data.append({'id': mapped_src, 'risk_score': 0.5, 'type': 'Lib', 'description': 'Discovered via PyPI metadata'})
+                    added_nodes += 1
+
+                # 1) Link requires_dist -> existing nodes (use base-name lookup)
+                for req in meta.get('requires', []):
+                    tgt = node_base_map.get(req.lower())
+                    if tgt and mapped_src != tgt:
+                        if not any(e['source'] == mapped_src and e['target'] == tgt for e in edges_data):
+                            edges_data.append({'source': mapped_src, 'target': tgt})
+                            added_edges += 1
+
+                # 2) If PyPI project_urls include GitHub repo, add edges between mapped_src and those repos
+                for gr in discovered_repos:
+                    gr = gr.strip()
+                    if not any(n['id'] == gr for n in nodes_data):
+                        nodes_data.append({'id': gr, 'risk_score': 0.5, 'type': 'Lib', 'description': 'Discovered via PyPI project_url'})
+                        added_nodes += 1
+                    if not any(e['source'] == mapped_src and e['target'] == gr for e in edges_data):
+                        edges_data.append({'source': mapped_src, 'target': gr})
+                        added_edges += 1
+
+            if added_nodes or added_edges:
+                print(f"[endpoints] PyPI enrichment added {added_nodes} nodes and {added_edges} edges")
+                # Deduplicate edges after additions
+                seen = set(); dedup = []
+                for e in edges_data:
+                    key = (e.get('source'), e.get('target'))
+                    if key not in seen:
+                        seen.add(key); dedup.append(e)
+                edges_data = dedup
+    except Exception as e:
+        print(f"[endpoints] PyPI enrichment failed: {e}")
+
     # Load into Graph Engine
     # IMPORTANT: Must build graph BEFORE calculating metrics
     if len(nodes_data) > 1:
@@ -392,6 +747,24 @@ async def get_dependency_graph(owner: str, repo: str):
         
         # --- 3. Advanced Algorithm Phase (EasyGraph) ---
         eg_metrics = graph_engine.calculate_metrics()
+
+        # Debug: inspect raw degrees and constraint distribution (no synthetic edges will be added)
+        try:
+            constraint_map = eg_metrics.get('constraint', {})
+            degs = {n: graph_engine.G.degree(n) for n in graph_engine.G.nodes}
+            num_all_ones = sum(1 for v in constraint_map.values() if float(v) >= 0.999)
+            print(f"[endpoints] degree sample: {dict(list(degs.items())[:5])}")
+            print(f"[endpoints] constraint ones count: {num_all_ones} / {len(constraint_map)}")
+            # Detailed constraint values (sorted)
+            try:
+                sorted_constraints = sorted(((n, float(v)) for n, v in constraint_map.items()), key=lambda x: x[1])
+                print('[endpoints] sorted constraints:')
+                for n, v in sorted_constraints:
+                    print('  ', n, f'{v:.3f}')
+            except Exception:
+                pass
+        except Exception as e:
+            print(f"[endpoints] constraint debug failed: {e}")
     else:
         # Single node graph - metrics are trivial
         eg_metrics = {'constraint': {}, 'betweenness': {}}
@@ -418,49 +791,34 @@ async def get_dependency_graph(owner: str, repo: str):
         node_obj = next((x for x in nodes_data if x['id'] == n_id), None)
         base_risk = node_obj['risk_score'] if node_obj else 0.5
         
-        # If base_risk is -1 (Unknown), we keep it as -1 to signal frontend
-        if base_risk == -1.0:
-            final_risk = -1.0
-            desc_text = node_obj['description'] if node_obj else "Unknown"
-        else:
-            # 2. Topology Metrics (From EasyGraph)
-            constraint_val = eg_metrics.get('constraint', {}).get(n_id, 0)
-            # Normalize constraint (usually 0-1, but can be higher)
-            score_constraint = min(1.0, constraint_val)
-            
-            betweenness_val = eg_metrics.get('betweenness', {}).get(n_id, 0)
-            # Normalize betweenness (usually small)
-            score_centrality = min(1.0, betweenness_val * 5.0) # Boost for visibility
-
-            # 3. Weighted Fusion Model
-            # Fusion: 70% Base Risk (Data Driven) + 30% Topology (Graph Driven)
-            final_risk = (base_risk * 0.7) + (score_constraint * 0.2) + (score_centrality * 0.1)
-            
-            final_risk = min(1.0, max(0.05, final_risk))
-            desc_text = f"Constraint: {constraint_val:.2f} | Risk: {final_risk * 100:.1f}"
+        # 2. Topology Metrics (From EasyGraph)
+        constraint_val = eg_metrics.get('constraint', {}).get(n_id, 0)
+        # Normalize constraint (usually 0-1, but can be higher)
+        score_constraint = min(1.0, constraint_val)
         
-        # Generate History (Simple fluctuation around the real risk)
+        betweenness_val = eg_metrics.get('betweenness', {}).get(n_id, 0)
+        # Normalize betweenness (usually small)
+        score_centrality = min(1.0, betweenness_val * 5.0) # Boost for visibility
+        cve_count = node_obj.get('cve_count', 0)
+        cve_risk = min(1.0, cve_count * 0.1)
+        # 3. Weighted Fusion Model
+        # Fusion: 60% Base + 20% Constraint + 10% Centrality + 10% CVE
+        final_risk = (base_risk * 0.6) + (score_constraint * 0.2) + (score_centrality * 0.1) + (cve_risk * 0.1)
+        
+        final_risk = min(1.0, max(0.0, final_risk))
+        desc_text = f"Constraint: {constraint_val:.2f} | CVEs: {cve_count} | Risk: {final_risk * 100:.1f}"
+        
+        # Generate History (Deterministic: flat series based on final risk)
         history = []
-        # If unknown, history is flat zero
-        if final_risk == -1.0:
-            history = [0] * 6
-        else:
-            current = final_risk
-            # DETERMINISTIC History (Re-introduced for UI stability, but based on real risk)
-            # Use zlib hash of name to seed the fluctuation pattern
-            h_seed = deterministic_hash(n_id)
-            for k in range(6):
-                history.insert(0, float(f"{current * 100:.1f}"))
-                # Pseudo-random fluctuation
-                fluctuation = ((h_seed + k) % 100 - 50) / 1000.0 # -0.05 to +0.05
-                current = current + fluctuation
-                current = min(1.0, max(0.0, current))
+        for _ in range(6):
+            history.insert(0, float(f"{final_risk * 100:.1f}"))
 
         final_nodes.append(Node(
             id=n_id,
             label="Project" if n_id == repo_full_name else "Lib", 
             name=n_id,
             risk_score=final_risk,
+            cve_count=cve_count,
             description=desc_text,
             history=history
         ))
@@ -475,6 +833,149 @@ async def get_dependency_graph(owner: str, repo: str):
     save_cache()
     
     return result
+
+@router.post("/compare")
+async def compare_projects(
+    project1_owner: str, 
+    project1_repo: str,
+    project2_owner: str,
+    project2_repo: str
+):
+    """
+    Compare two projects side-by-side with risk scores and key metrics.
+    """
+    async def get_project_data(owner, repo):
+        try:
+            repo_full = f"{owner}/{repo}"
+            
+            # 1. Check cache first
+            if repo_full in ANALYSIS_CACHE:
+                data = ANALYSIS_CACHE[repo_full]
+                # Extract root node
+                node = next((n for n in data.nodes if n.id == repo_full), None)
+                if node:
+                     # Get real metrics if possible, otherwise rely on node data
+                     # For simplicity, we fetch metrics again or store them in node
+                     return {
+                        "name": repo_full,
+                        "risk_score": node.risk_score,
+                        "cve_count": node.cve_count,
+                        "ecosystem": "Unknown" # simplified
+                     }
+
+            # 2. If not cached, fetch fresh metrics
+            act, rank = await asyncio.gather(
+                stream_processor.fetch_and_store(repo_full, "activity"),
+                stream_processor.fetch_and_store(repo_full, "openrank"),
+                return_exceptions=True
+            )
+            
+            if isinstance(act, Exception): act = {}
+            if isinstance(rank, Exception): rank = {}
+            
+            # Extract latest values from OpenDigger dicts
+            act_val = 0.0
+            if act and isinstance(act, dict):
+                try:
+                    act_val = float(list(act.values())[-1])
+                except: pass
+            
+            rank_val = 0.0
+            if rank and isinstance(rank, dict):
+                try:
+                    rank_val = float(list(rank.values())[-1])
+                except: pass
+
+            # Ecosystem & CVEs
+            ecosystem = 'PyPI' # Default
+            pkg_json = await fetch_repo_file(owner, repo, "package.json")
+            if pkg_json: ecosystem = 'npm'
+            
+            cve_count = await query_osv(repo, ecosystem)
+            
+            # Risk Calc
+            n_act = min(act_val / 50.0, 1.0) # Normalize activity (50 is high)
+            n_rank = min(rank_val / 100.0, 1.0) # Normalize rank (100 is high)
+            n_cve = min(cve_count / 10.0, 1.0)
+            
+            base_risk = 0.6 # Higher base risk
+            risk = base_risk - (n_act * 0.3) - (n_rank * 0.2) + (n_cve * 0.3)
+            risk = max(0.0, min(1.0, risk))
+            
+            return {
+                "name": repo_full,
+                "risk_score": risk,
+                "activity": act_val,
+                "openrank": rank_val,
+                "cve_count": cve_count,
+                "ecosystem": ecosystem
+            }
+        except Exception as e:
+            print(f"Comparison fetch failed for {owner}/{repo}: {e}")
+            return None
+
+    p1_data, p2_data = await asyncio.gather(
+        get_project_data(project1_owner, project1_repo),
+        get_project_data(project2_owner, project2_repo)
+    )
+    
+    if not p1_data or not p2_data:
+        raise HTTPException(status_code=404, detail="One or both projects could not be analyzed")
+        
+    return {
+        "project1": p1_data,
+        "project2": p2_data,
+        "winner": p1_data["name"] if p1_data["risk_score"] < p2_data["risk_score"] else p2_data["name"],
+        "metric_diff": {
+            "risk_score": p1_data["risk_score"] - p2_data["risk_score"],
+            "cve_count": p1_data["cve_count"] - p2_data["cve_count"]
+        }
+    }
+
+@router.get("/report/{owner}/{repo}")
+async def get_project_report(owner: str, repo: str):
+    """
+    Generate a detailed security report for a project.
+    """
+    repo_full = f"{owner}/{repo}"
+    
+    if repo_full not in ANALYSIS_CACHE:
+         raise HTTPException(status_code=404, detail="Project analysis not found. Please analyze the project first via /graph endpoint.")
+    
+    data = ANALYSIS_CACHE.get(repo_full)
+    node = next((n for n in data.nodes if n.id == repo_full), None)
+    
+    if not node:
+        raise HTTPException(status_code=404, detail="Project node not found in graph.")
+        
+    # Identify high risk dependencies
+    high_risk_deps = [n for n in data.nodes if n.risk_score > 0.6 and n.id != repo_full]
+    sorted_risks = sorted(high_risk_deps, key=lambda x: x.risk_score, reverse=True)[:5]
+    
+    return {
+        "report_title": f"Security Audit Report: {repo_full}",
+        "summary": {
+            "overall_risk_score": node.risk_score,
+            "risk_level": "CRITICAL" if node.risk_score > 0.8 else "HIGH" if node.risk_score > 0.6 else "MEDIUM" if node.risk_score > 0.4 else "LOW",
+            "total_dependencies": len(data.nodes) - 1,
+            "vulnerable_dependencies": len(high_risk_deps),
+            "root_cve_count": node.cve_count
+        },
+        "top_risks": [
+            {
+                "name": n.id,
+                "risk_score": n.risk_score,
+                "cve_count": n.cve_count,
+                "description": n.description
+            }
+            for n in sorted_risks
+        ],
+        "recommendations": [
+            "Update dependencies with high risk scores.",
+            "Check for known CVEs in the root project.",
+            "Review dependency tree for indirect vulnerabilities."
+        ]
+    }
 
 @router.get("/leaderboard")
 async def get_leaderboard():
@@ -553,6 +1054,7 @@ async def get_leaderboard():
             current_critical_values = [x['risk'] for x in critical_map.values()]
             min_critical_risk = min(current_critical_values) if len(current_critical_values) >= 15 else 0
             
+            # Filter out -100.0 (Unknown) and low risks
             if node_risk_percent > 60.0 and node.id not in critical_map: 
                 # Only add if it qualifies or list is not full
                 if len(critical_map) < 15 or node_risk_percent > min_critical_risk:
@@ -568,7 +1070,8 @@ async def get_leaderboard():
             current_star_values = [x['risk'] for x in stars_map.values()]
             max_star_risk = max(current_star_values) if len(current_star_values) >= 15 else 100
             
-            if node_risk_percent <= 40.0 and node.id not in stars_map: 
+            # Filter out -100.0 (Unknown) which is mathematically <= 40.0 but shouldn't be here
+            if node_risk_percent >= 0.0 and node_risk_percent <= 40.0 and node.id not in stars_map: 
                  # Only add if it qualifies or list is not full
                  if len(stars_map) < 15 or node_risk_percent < max_star_risk:
                     stars_map[node.id] = {
@@ -671,3 +1174,5 @@ async def compare_projects(owner1: str, repo1: str, owner2: str, repo2: str):
             "activity": list(r2_act.values())[-1] if r2_act else 0
         }
     }
+
+

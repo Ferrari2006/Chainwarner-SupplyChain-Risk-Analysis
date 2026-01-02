@@ -2,6 +2,7 @@ import sqlite3
 from typing import Optional, Dict, Any
 import json
 import os
+import threading
 
 DB_PATH = "risk_data.db"
 
@@ -80,5 +81,30 @@ class DatabaseManager:
         conn.close()
         return [{'source': r[0], 'target': r[1], 'weight': r[2]} for r in rows]
 
-# Global Instance
-db = DatabaseManager()
+class MemoryDatabaseManager:
+    def __init__(self):
+        self._metrics: Dict[str, Any] = {}
+        self._edges: list = []
+        self._lock = threading.Lock()
+
+    def upsert_metrics(self, project_name: str, metrics: Dict[str, Any]):
+        with self._lock:
+            self._metrics[project_name] = metrics
+
+    def get_metrics(self, project_name: str) -> Optional[Dict[str, Any]]:
+        return self._metrics.get(project_name)
+
+    def save_topology(self, edges: list):
+        with self._lock:
+            for e in edges:
+                if not any(x['source'] == e['source'] and x['target'] == e['target'] for x in self._edges):
+                    self._edges.append({'source': e['source'], 'target': e['target'], 'weight': e.get('weight', 1.0)})
+
+    def get_all_edges(self):
+        return list(self._edges)
+
+storage_mode = os.getenv("CHAINWARNER_STORAGE", "memory").lower()
+if storage_mode == "sqlite":
+    db = DatabaseManager()
+else:
+    db = MemoryDatabaseManager()

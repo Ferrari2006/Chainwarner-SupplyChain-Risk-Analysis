@@ -6,6 +6,7 @@ class Node(BaseModel):
     label: str  # e.g., "Project", "Library"
     name: str
     risk_score: float = 0.0
+    cve_count: int = 0
     description: Optional[str] = None
     history: Optional[List[float]] = None # Historical risk scores (last 6 months)
 

@@ -3,6 +3,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from app.api import endpoints
+import os
 
 app = FastAPI(title="ChainWarner API", description="Supply Chain Risk Monitoring Platform")
 
@@ -17,7 +18,8 @@ app.add_middleware(
 )
 
 # Mount Static and Templates
-app.mount("/static", StaticFiles(directory="app/static"), name="static")
+if os.path.isdir("app/static"):
+    app.mount("/static", StaticFiles(directory="app/static"), name="static")
 templates = Jinja2Templates(directory="app/templates")
 
 # Include API Router
@@ -27,6 +29,10 @@ app.include_router(endpoints.router, prefix="/api/v1")
 async def root(request: Request):
     """Serve the frontend dashboard"""
     return templates.TemplateResponse("index.html", {"request": request})
+
+@app.get("/health")
+async def health():
+    return {"status": "ok"}
 
 if __name__ == "__main__":
     import uvicorn

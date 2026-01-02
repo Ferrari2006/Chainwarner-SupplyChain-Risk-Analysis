@@ -1,72 +1,127 @@
-import random
+import os
+
 
 class NLPEngine:
     def __init__(self):
         self.sentiment_analyzer = None
+        self.model_type = None
+        self.model_path = os.path.join(os.path.dirname(__file__), "nlp_model.joblib")
 
     def _load_model(self):
-        if self.sentiment_analyzer:
-            return
-        
-        # Upgrade: Use Security-specific BERT model (JackFram/secbert)
-        print("Loading Security NLP Model... (JackFram/secbert)")
+        # Try transformers first, then sklearn fallback. If both fail, mark mock.
         try:
-            from transformers import pipeline, AutoTokenizer, AutoModelForMaskedLM
-            
-            # Use SecBERT for security context understanding
-            # Note: pipeline("sentiment-analysis") might not work directly with MaskedLM
-            # So we use "fill-mask" or a compatible task, OR fallback to a security-tuned classifier.
-            # Actually, for risk scoring, a fine-tuned classifier is better.
-            # Let's use a model fine-tuned for vulnerability detection if available, 
-            # otherwise stick to a robust general model but label it correctly.
-            
-            # Since JackFram/secbert is a MaskedLM (not a classifier), we use it to extract features
-            # or use a model fine-tuned on SST-2 but trained on security texts.
-            # For this demo, to ensure stability, we will use a model that definitely has a classification head.
-            # "yiyanghkust/finbert-tone" is good for financial risk, let's stick to "distilbert" for stability
-            # BUT rename the logging to show we are ready for SecBERT integration.
-            
-            # REAL UPGRADE: Try to load a specific security classifier
-            # If not available, fallback to distilbert.
+            from transformers import pipeline
             self.sentiment_analyzer = pipeline(
-                "text-classification", 
-                model="distilbert/distilbert-base-uncased-finetuned-sst-2-english", 
-                top_k=None
+                "text-classification",
+                model="distilbert/distilbert-base-uncased-finetuned-sst-2-english",
+                top_k=None,
             )
-            print("Security Model Interface Loaded.")
-            
+            self.model_type = 'transformers'
+            print("NLPEngine: loaded transformers pipeline.")
+            return
+        except Exception:
+            pass
+
+        # Try sklearn fallback (load or train a tiny model)
+        try:
+            from joblib import load
+            if os.path.exists(self.model_path):
+                self.sentiment_analyzer = load(self.model_path)
+                self.model_type = 'sklearn'
+                print(f"NLPEngine: loaded sklearn model from {self.model_path}")
+                return
+        except Exception:
+            pass
+
+        # If sklearn model not found, we'll train one on demand when needed.
+        self.model_type = None
+
+    def _train_default_sklearn(self):
+        try:
+            from sklearn.pipeline import make_pipeline
+            from sklearn.feature_extraction.text import TfidfVectorizer
+            from sklearn.linear_model import LogisticRegression
+            from joblib import dump
+
+            risky = [
+                "exploit", "vulnerability", "CVE", "buffer overflow", "privilege escalation",
+                "unauthenticated access", "bypass authentication", "race condition", "memory leak"
+            ]
+            safe = [
+                "update docs", "refactor code", "add tests", "improve performance", "minor fix",
+                "chore", "cleanup", "enhancement", "typo fix"
+            ]
+
+            X = risky + safe
+            y = [1] * len(risky) + [0] * len(safe)
+
+            pipeline = make_pipeline(
+                TfidfVectorizer(ngram_range=(1, 2), max_features=2000),
+                LogisticRegression(max_iter=1000)
+            )
+            pipeline.fit(X, y)
+
+            dump(pipeline, self.model_path)
+            self.sentiment_analyzer = pipeline
+            self.model_type = 'sklearn'
+            print(f"NLPEngine: trained and saved sklearn model to {self.model_path}")
+            return True
         except Exception as e:
-            print(f"Warning: Transformers model failed to load. Using mock. {e}")
-            self.sentiment_analyzer = "MOCK"
+            print(f"NLPEngine: sklearn training failed: {e}")
+            return False
+
+    def _ensure_sklearn_loaded(self):
+        # Attempt to load existing model, else train a minimal one
+        try:
+            from joblib import load
+            if os.path.exists(self.model_path):
+                self.sentiment_analyzer = load(self.model_path)
+                self.model_type = 'sklearn'
+                return True
+        except Exception:
+            pass
+        return self._train_default_sklearn()
 
     def analyze_text_risk(self, texts):
-        """
-        Analyze a list of texts (commit messages, issues) and return a risk score.
-        Negative sentiment -> Higher Risk
-        """
+        """Analyze texts and return a risk score in [0,1]."""
         if not texts:
             return 0.0
 
-        if not self.sentiment_analyzer:
+        if isinstance(texts, str):
+            texts = [texts]
+
+        # Ensure a model is loaded
+        if not self.model_type:
+            # Try to load transformers/sklearn or train sklearn
             self._load_model()
-            
-        if self.sentiment_analyzer == "MOCK":
-             return random.random() * 0.5
+            if not self.model_type:
+                # try ensure sklearn (train) if transformers missing
+                if not self._ensure_sklearn_loaded():
+                    self.model_type = 'mock'
 
+        if self.model_type == 'transformers' and self.sentiment_analyzer:
+            try:
+                results = self.sentiment_analyzer(texts[:5])
+                scores = []
+                for r in results:
+                    if isinstance(r, list):
+                        neg = next((c['score'] for c in r if c.get('label', '').upper().startswith('NEG')), 0.0)
+                        scores.append(neg)
+                    else:
+                        label = r.get('label', '').upper()
+                        score = r.get('score', 0.0)
+                        scores.append(score if label.startswith('NEG') else (1 - score))
+                return float(sum(scores) / max(1, len(scores)))
+            except Exception as e:
+                print(f"NLPEngine: transformers analysis failed: {e}")
 
-        try:
-            # Analyze batch
-            results = self.sentiment_analyzer(texts[:5]) # Limit to 5 for speed
-            
-            risk_score = 0.0
-            count = 0
-            for res in results:
-                # res is a list of dicts [{'label': 'NEGATIVE', 'score': 0.9}, ...]
-                # Find negative score
-                neg_score = next((item['score'] for item in res if item['label'] == 'NEGATIVE'), 0.0)
-                risk_score += neg_score
-                count += 1
-            
-            return risk_score / count if count > 0 else 0.0
-        except:
-            return 0.5
+        if self.model_type == 'sklearn' and self.sentiment_analyzer:
+            try:
+                probs = self.sentiment_analyzer.predict_proba(texts[:32])
+                risky_probs = [p[1] for p in probs]
+                return float(sum(risky_probs) / max(1, len(risky_probs)))
+            except Exception as e:
+                print(f"NLPEngine: sklearn analysis failed: {e}")
+
+        # Final fallback
+        return 0.25
