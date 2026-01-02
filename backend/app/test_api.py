@@ -1,7 +1,7 @@
 import requests
 import json
 
-url = 'http://localhost:8000/api/v1/analyze/django/django'
+url = 'http://localhost:8000/api/v1/graph/fastapi/fastapi'
 response = requests.get(url)
 if response.status_code == 200:
     data = response.json()
