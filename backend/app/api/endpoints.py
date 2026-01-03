@@ -630,22 +630,40 @@ async def get_dependency_graph(owner: str, repo: str):
             dep_openrank = curr_rank
             dep_activity = curr_act
             
-            norm_rank = min(1.0, curr_rank / max_rank)
-            norm_act = min(1.0, curr_act / max_act)
+            # V4 ALGORITHM: Reputation-First Model (User Request: "Pallets should be green")
+            # Logic: High Rank = High Trust. Low Activity doesn't mean high risk for mature projects.
             
-            # Risk is inverse of health
-            # V3 Algo Update: Weight Activity higher (70%) to penalize legacy/maintained-mode projects
-            # 30% weight on Rank, 70% on Activity
-            # High Rank + Low Activity (Legacy) -> High Risk
-            dep_risk = 1.0 - (norm_rank * 0.3 + norm_act * 0.7)
+            # 1. Normalize (Sigmoid-like approach for Rank to handle large variance)
+            # Rank > 100 is decent, Rank > 500 is very strong
+            norm_rank = curr_rank / (curr_rank + 50.0) # 50->0.5, 200->0.8, 1000->0.95
+            
+            # Activity > 5 is decent, > 20 is very active
+            norm_act = curr_act / (curr_act + 5.0)     # 5->0.5, 20->0.8
+            
+            # 2. Safety / Reputation Score (0 to 1, Higher is Better)
+            # Rank dominates (70%) because mature projects are trusted even if maintenance slows
+            reputation = (0.7 * norm_rank) + (0.3 * norm_act)
+            
+            # 3. Base Risk (Inverse of Reputation)
+            # If reputation is 0.9, base risk is 0.05 (very low)
+            base_risk = (1.0 - reputation) * 0.5 
+            
+            # 4. CVE Risk (Damped by Reputation)
+            # High reputation projects manage CVEs better, so we trust them more.
+            # Max CVE penalty capped at 0.4
+            raw_cve_risk = min(0.4, cve_count * 0.05)
+            # Reputation suppression: High rep reduces CVE impact by up to 80%
+            effective_cve_risk = raw_cve_risk * (1.0 - (reputation * 0.8))
+            
+            dep_risk = base_risk + effective_cve_risk
             dep_risk = max(0.0, min(0.95, dep_risk))
-            desc_text = f"Rank: {dep_openrank:.1f} | CVEs: {cve_count} | Risk: {dep_risk * 100:.1f}"
+            
+            desc_text = f"Rank: {dep_openrank:.1f} | Rep: {reputation:.2f} | Risk: {dep_risk * 100:.1f}"
         else:
             # If no data found in OpenDigger
-            # STRICTLY NO RANDOMNESS per user request
-            # Use neutral base risk to enable topology-based fusion, avoid N/A
+            # Use neutral base risk
             dep_risk = 0.5
-            desc_text = f"Data Unavailable (OpenDigger Missing) | CVEs: {cve_count} | Using topology fallback"
+            desc_text = f"Data Unavailable | CVEs: {cve_count} | Using topology fallback"
 
         nodes_data.append({"id": node_id, "risk_score": dep_risk, "type": "Lib", "description": desc_text, "cve_count": cve_count})
         edges_data.append({"source": repo_full_name, "target": node_id})
@@ -834,11 +852,31 @@ async def get_dependency_graph(owner: str, repo: str):
             for child_id in children:
                 # If child is in graph
                 if child_id in prop_risk_map:
-                    # Apply decay: 0.8 to allow "Orange" layer between Green and Red
-                    max_child_risk = max(max_child_risk, prop_risk_map[child_id] * 0.8)
+                    # Apply decay: 0.5 to keep things mostly green unless deep red
+                    max_child_risk = max(max_child_risk, prop_risk_map[child_id] * 0.5)
             
-            # Propagation Logic: Risk = Max(Self, Child * 0.8) -> Balanced "Wooden Barrel"
-            new_risk = max(current_risk, max_child_risk)
+            # V4 Propagation Logic: Reputation Suppression
+            # High Reputation projects suppress dependency risks.
+            # "I am strong, I audit my dependencies."
+            
+            # We need to recover the reputation score. Since we didn't store it in a map,
+            # we can approximate it from base_risk (BR = (1-Rep)*0.5) => Rep = 1 - (BR / 0.5)
+            # Or just use current_risk if it's low.
+            
+            # Let's re-fetch node obj to be safe, but it doesn't have Rep.
+            # Heuristic: If current_risk is low (<0.2), Rep is High.
+            # Suppression Factor: If I am low risk, I suppress incoming risk by 80%.
+            
+            suppression = 0.0
+            if current_risk < 0.1: suppression = 0.9
+            elif current_risk < 0.2: suppression = 0.7
+            elif current_risk < 0.4: suppression = 0.4
+            
+            # Incoming risk is damped by my suppression capability
+            incoming_risk = max_child_risk * (1.0 - suppression)
+            
+            # Final Risk is Max of Self and Incoming
+            new_risk = max(current_risk, incoming_risk)
             
             if abs(new_risk - current_risk) > 0.01:
                 prop_risk_map[n_id] = new_risk
