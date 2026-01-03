@@ -27,61 +27,74 @@ class GraphEngine:
         5. K-Core (if available)
         """
         metrics = {}
+        import os
+        lite_mode = os.getenv("LITE_MODE", "true").lower() == "true"
+        node_count = self.G.number_of_nodes()
         
         # 1. Structural Holes (Burt's Constraint)
         # Identifies brokers who connect otherwise disconnected communities.
-        try:
-            # Compute constraint on an undirected copy (NetworkX) to avoid
-            # directed/disconnected artifacts and keep results consistent.
+        # OPTIMIZATION: Skip constraint on large graphs or lite mode (it's O(V^3) or O(VE))
+        if not lite_mode and node_count < 100:
             try:
-                import networkx as nx
-                nx_g = nx.Graph()
-                nx_g.add_nodes_from(list(self.G.nodes))
-                # Add edges as undirected (only unique pairs)
+                # Compute constraint on an undirected copy (NetworkX) to avoid
+                # directed/disconnected artifacts and keep results consistent.
                 try:
-                    edges_iter = self.G.edges
-                except:
-                    edges_iter = []
-                for u, v in edges_iter:
+                    import networkx as nx
+                    nx_g = nx.Graph()
+                    nx_g.add_nodes_from(list(self.G.nodes))
+                    # Add edges as undirected (only unique pairs)
                     try:
-                        nx_g.add_edge(u, v)
+                        edges_iter = self.G.edges
                     except:
-                        pass
+                        edges_iter = []
+                    for u, v in edges_iter:
+                        try:
+                            nx_g.add_edge(u, v)
+                        except:
+                            pass
 
-                raw_constraint = nx.constraint(nx_g)
-                # Log raw constraint for debugging (can be removed later)
-                print("[graph_engine] raw_constraint sample:", dict(list(raw_constraint.items())[:5]))
+                    raw_constraint = nx.constraint(nx_g)
+                    # Log raw constraint for debugging (can be removed later)
+                    print("[graph_engine] raw_constraint sample:", dict(list(raw_constraint.items())[:5]))
 
-                # Sanitize NaN or missing values with degree-based heuristic
-                for n in nx_g.nodes():
-                    val = raw_constraint.get(n, None)
-                    if val is None or (isinstance(val, float) and val != val):
-                        deg = nx_g.degree(n)
-                        max_deg = max(1, nx_g.number_of_nodes() - 1)
-                        raw_constraint[n] = (deg / max_deg) if max_deg > 0 else 0.0
+                    # Sanitize NaN or missing values with degree-based heuristic
+                    for n in nx_g.nodes():
+                        val = raw_constraint.get(n, None)
+                        if val is None or (isinstance(val, float) and val != val):
+                            deg = nx_g.degree(n)
+                            max_deg = max(1, nx_g.number_of_nodes() - 1)
+                            raw_constraint[n] = (deg / max_deg) if max_deg > 0 else 0.0
 
-                metrics['constraint'] = raw_constraint
+                    metrics['constraint'] = raw_constraint
+                except Exception as e:
+                    print(f"Constraint (NetworkX) calculation failed, falling back: {e}")
+                    # Fallback: Degree Centrality as a proxy
+                    metrics['constraint'] = {n: (self.G.degree(n) / max(1, len(self.G) - 1)) for n in self.G.nodes}
             except Exception as e:
-                print(f"Constraint (NetworkX) calculation failed, falling back: {e}")
+                print(f"EasyGraph/NetworkX constraint failed: {e}")
                 # Fallback: Degree Centrality as a proxy
-                metrics['constraint'] = {n: (self.G.degree(n) / max(1, len(self.G) - 1)) for n in self.G.nodes}
-        except Exception as e:
-            print(f"EasyGraph/NetworkX constraint failed: {e}")
-            # Fallback: Degree Centrality as a proxy
-            try:
-                metrics['constraint'] = {n: (self.G.degree(n) / max(1, len(self.G) - 1)) for n in self.G.nodes}
-            except:
-                metrics['constraint'] = {n: 0.0 for n in self.G.nodes}
+                try:
+                    metrics['constraint'] = {n: (self.G.degree(n) / max(1, len(self.G) - 1)) for n in self.G.nodes}
+                except:
+                    metrics['constraint'] = {n: 0.0 for n in self.G.nodes}
+        else:
+            # Fast Fallback for Lite Mode
+            metrics['constraint'] = {n: (self.G.degree(n) / max(1, len(self.G) - 1)) for n in self.G.nodes}
 
         # 2. Betweenness Centrality
         # Identifies nodes that control information flow.
-        try:
-            betweenness = eg.betweenness_centrality(self.G)
-            metrics['betweenness'] = betweenness
-        except Exception as e:
-            print(f"Error calculating betweenness: {e}")
+        # OPTIMIZATION: Skip betweenness on large graphs (O(VE))
+        if not lite_mode and node_count < 200:
+            try:
+                betweenness = eg.betweenness_centrality(self.G)
+                metrics['betweenness'] = betweenness
+            except Exception as e:
+                print(f"Error calculating betweenness: {e}")
+        else:
+             metrics['betweenness'] = {n: 0.0 for n in self.G.nodes}
 
         # 3. PageRank (Influence)
+        # PageRank is relatively fast (iterative), usually safe to keep
         try:
             pagerank = eg.pagerank(self.G)
             metrics['pagerank'] = pagerank

@@ -191,6 +191,7 @@ def enrich_graph_topology(nodes, edges):
     """
     Add edges between existing nodes based on known ecosystem relations.
     This reduces Burt's Constraint from 1.0 (Star Graph) to realistic values.
+    OPTIMIZED: Stricter matching to avoid duplicate/spam edges.
     """
     # Create maps for lookup:
     # full_map: lower_case_full_id -> original full id (e.g. 'tiangolo/fastapi')
@@ -210,11 +211,6 @@ def enrich_graph_topology(nodes, edges):
     for n in nodes:
         base = n['id'].split('/')[-1].lower()
         base_map.setdefault(base, []).append(n['id'])
-    # Build normalized map for fuzzy matching
-    norm_base_map = {}
-    for base_name, ids in base_map.items():
-        norm = normalize(base_name)
-        norm_base_map.setdefault(norm, []).extend(ids)
     
     extra_edges = []
     
@@ -224,19 +220,19 @@ def enrich_graph_topology(nodes, edges):
         targets = ECOSYSTEM_RELATIONS.get(src_base, [])
         for tgt in targets:
             tgt_lower = tgt.lower()
-            # 1) Exact base match
             matched = set()
+            
+            # 1) Exact base match (High Confidence)
             if tgt_lower in base_map:
                 matched.update(base_map[tgt_lower])
-            # 2) Normalized fuzzy match: substring/startswith
-            tgt_norm = normalize(tgt_lower)
-            for norm_key, ids in norm_base_map.items():
-                if tgt_norm and (norm_key == tgt_norm or norm_key.startswith(tgt_norm) or tgt_norm.startswith(norm_key) or tgt_norm in norm_key or norm_key in tgt_norm):
-                    matched.update(ids)
-            # 3) Full repo name contains check (owner or repo part)
-            for full_lower, real_id in full_map.items():
-                if tgt_lower in full_lower or tgt_norm in normalize(full_lower.split('/')[-1]):
-                    matched.add(real_id)
+            
+            # 2) Full repo name contains check (owner or repo part)
+            # Only if exact match failed to avoid over-matching
+            if not matched:
+                for full_lower, real_id in full_map.items():
+                    # Strict containment: ensure boundaries or distinct segments
+                    if f"/{tgt_lower}" in full_lower or full_lower.startswith(f"{tgt_lower}/"):
+                        matched.add(real_id)
 
             for real_tgt in matched:
                 if real_tgt != src_full and not any(e['source'] == src_full and e['target'] == real_tgt for e in edges):
@@ -249,25 +245,21 @@ def enrich_graph_topology(nodes, edges):
         present_members = []
         for m in group["members"]:
             m_lower = m.lower()
-            # Try exact base match
             if m_lower in base_map:
                 present_members.extend(base_map[m_lower])
-            else:
-                # Try normalized fuzzy matches
-                m_norm = normalize(m_lower)
-                for norm_key, ids in norm_base_map.items():
-                    if m_norm and (norm_key == m_norm or norm_key.startswith(m_norm) or m_norm in norm_key):
-                        present_members.extend(ids)
         
-        # If 2 or more members exist, link them sequentially or fully
-        # Let's link them in a ring to avoid too many edges but create loops
+        # Deduplicate members
+        present_members = list(set(present_members))
+        
+        # If 2 or more members exist, link them sequentially
         if len(present_members) > 1:
             for i in range(len(present_members)):
                 src = present_members[i]
                 tgt = present_members[(i + 1) % len(present_members)] # Wrap around
                 
                 # Don't duplicate if existing
-                if not any(e['source'] == src and e['target'] == tgt for e in edges) and \
+                if src != tgt and \
+                   not any(e['source'] == src and e['target'] == tgt for e in edges) and \
                    not any(e['source'] == tgt and e['target'] == src for e in edges): # Undirected logic
                     extra_edges.append({"source": src, "target": tgt})
 

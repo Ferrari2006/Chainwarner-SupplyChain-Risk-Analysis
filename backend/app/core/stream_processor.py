@@ -23,7 +23,7 @@ class StreamProcessor:
             try:
                 async with client.stream('GET', url, timeout=10.0) as response:
                     if response.status_code != 200:
-                        print(f"Stream Error: {response.status_code}")
+                        # print(f"Stream Error: {response.status_code}")
                         return None
                     
                     # 2. Parse (Chunked) & 3. Store (Immediate Persistence)
@@ -33,7 +33,14 @@ class StreamProcessor:
                     # In a real PPT scenario, you'd claim "ijson" or "simdjson" usage.
                     
                     data_buffer = []
+                    total_size = 0
+                    MAX_SIZE = 10 * 1024 * 1024 # 10MB Limit for Render
+                    
                     async for chunk in response.aiter_text():
+                        total_size += len(chunk)
+                        if total_size > MAX_SIZE:
+                            print(f"StreamProcessor: Aborted {url} (Size > 10MB)")
+                            return None
                         data_buffer.append(chunk)
                     
                     full_text = "".join(data_buffer)
@@ -45,7 +52,7 @@ class StreamProcessor:
                     # 5. Destroy: Memory is released as function exits
                     return data
             except Exception as e:
-                print(f"Stream Fetch Failed: {e}")
+                # print(f"Stream Fetch Failed: {e}")
                 return None
 
 stream_processor = StreamProcessor()
