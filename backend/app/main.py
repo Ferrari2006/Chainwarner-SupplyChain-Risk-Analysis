@@ -3,6 +3,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from app.api import endpoints
+from app.core.stream_processor import stream_processor
 import os
 
 app = FastAPI(title="ChainWarner API", description="Supply Chain Risk Monitoring Platform")
@@ -33,6 +34,10 @@ async def root(request: Request):
 @app.get("/health")
 async def health():
     return {"status": "ok"}
+
+@app.on_event("shutdown")
+async def _shutdown():
+    await stream_processor.aclose()
 
 if __name__ == "__main__":
     import uvicorn

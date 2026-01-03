@@ -12,7 +12,7 @@ import httpx
 import json
 import re
 import os
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional, Tuple
 from pydantic import BaseModel
 
 router = APIRouter()
@@ -57,29 +57,30 @@ def save_cache():
     except Exception as e:
         print(f"Failed to save cache: {e}")
 
-# Fallback Risks for demo if network fails
-PREDEFINED_RISKS = {
-    "log4j": 95,
-    "fastjson": 90, 
-    "struts2": 85,
-    "openssl": 80
-}
+PYPI_META_CACHE: Dict[str, Dict[str, Any]] = {}
+OSV_CACHE: Dict[Tuple[str, str], int] = {}
 
-async def fetch_repo_file(owner: str, repo: str, path: str) -> str:
+# Fallback Risks removed as per request for real data only.
+
+async def fetch_repo_file(owner: str, repo: str, path: str, client: Optional[httpx.AsyncClient] = None) -> Optional[str]:
     """Fetch raw file content from GitHub (via jsDelivr CDN for reliability)."""
-    # Try main branch first, then master
-    # Use jsDelivr to bypass raw.githubusercontent.com DNS pollution
-    for branch in ["main", "master"]:
-        # url = f"https://raw.githubusercontent.com/{owner}/{repo}/{branch}/{path}"
-        url = f"https://cdn.jsdelivr.net/gh/{owner}/{repo}@{branch}/{path}"
-        try:
-            async with httpx.AsyncClient() as client:
-                resp = await client.get(url, timeout=5.0)
+    close_client = False
+    if client is None:
+        client = httpx.AsyncClient(timeout=5.0)
+        close_client = True
+    try:
+        for branch in ["main", "master"]:
+            url = f"https://cdn.jsdelivr.net/gh/{owner}/{repo}@{branch}/{path}"
+            try:
+                resp = await client.get(url)
                 if resp.status_code == 200:
                     return resp.text
-        except:
-            pass
-    return None
+            except Exception:
+                continue
+        return None
+    finally:
+        if close_client:
+            await client.aclose()
 
 def parse_dependencies(content: str, fmt: str) -> List[str]:
     """Extract dependency names from package files."""
@@ -88,8 +89,9 @@ def parse_dependencies(content: str, fmt: str) -> List[str]:
         try:
             data = json.loads(content)
             deps.extend(list(data.get('dependencies', {}).keys()))
-            deps.extend(list(data.get('devDependencies', {}).keys())) # Include dev deps for richer graph
-            deps.extend(list(data.get('peerDependencies', {}).keys()))
+            # devDependencies are considered trivial and ignored for high-level risk graph
+            # deps.extend(list(data.get('devDependencies', {}).keys())) 
+            # deps.extend(list(data.get('peerDependencies', {}).keys()))
         except:
             pass
     elif fmt == 'txt':
@@ -280,60 +282,69 @@ def resolve_repo_name(pkg_name: str) -> str:
     """Try to map a package name to a GitHub repo owner/name."""
     if "/" in pkg_name:
         return pkg_name # Already has owner
-    return PACKAGE_MAP.get(pkg_name.lower(), f"{pkg_name}/{pkg_name}")
+    return PACKAGE_MAP.get(pkg_name.lower(), f"pypi/{pkg_name}")
 
 
 from urllib.parse import urlparse
 
 
-async def fetch_pypi_metadata(pkg_name: str) -> Dict[str, Any]:
+async def fetch_pypi_metadata(pkg_name: str, client: Optional[httpx.AsyncClient] = None) -> Dict[str, Any]:
     """Fetch minimal metadata from PyPI: requires_dist and project_urls.
     Returns dict with keys: requires (list of base package names), github_repos (list of owner/repo strings)
     """
+    key = pkg_name.lower().strip()
+    cached = PYPI_META_CACHE.get(key)
+    if cached is not None:
+        return cached
     out = {"requires": [], "github_repos": []}
     # PyPI package names are case-insensitive; try as-is
-    url = f"https://pypi.org/pypi/{pkg_name}/json"
+    url = f"https://pypi.org/pypi/{key}/json"
     try:
-        async with httpx.AsyncClient() as client:
-            resp = await client.get(url, timeout=8.0)
+        close_client = False
+        if client is None:
+            client = httpx.AsyncClient(timeout=8.0)
+            close_client = True
+        try:
+            resp = await client.get(url)
             if resp.status_code != 200:
+                PYPI_META_CACHE[key] = out
                 return out
             data = resp.json()
-            info = data.get('info', {})
-            # Parse requires_dist (may be None)
-            requires = info.get('requires_dist') or []
-            for r in requires:
-                # r can be like 'package (>1.0); extra == "dev"'
-                m = re.match(r"^([A-Za-z0-9\-_.]+)", r)
-                if m:
-                    out['requires'].append(m.group(1).lower())
+        finally:
+            if close_client:
+                await client.aclose()
+        info = data.get('info', {})
+        requires = info.get('requires_dist') or []
+        for r in requires:
+            m = re.match(r"^([A-Za-z0-9\-_.]+)", r)
+            if m:
+                out['requires'].append(m.group(1).lower())
 
-            # Parse project_urls and home_page for github links using urlparse
-            urls = []
-            pu = info.get('project_urls') or {}
-            if isinstance(pu, dict):
-                urls.extend([v for v in pu.values() if v])
-            home = info.get('home_page')
-            if home:
-                urls.append(home)
+        urls = []
+        pu = info.get('project_urls') or {}
+        if isinstance(pu, dict):
+            urls.extend([v for v in pu.values() if v])
+        home = info.get('home_page')
+        if home:
+            urls.append(home)
 
-            for u in urls:
-                try:
-                    if not u:
-                        continue
-                    p = urlparse(u)
-                    if 'github.com' in p.netloc.lower():
-                        parts = [seg for seg in p.path.split('/') if seg]
-                        if len(parts) >= 2:
-                            owner = parts[0].strip()
-                            repo = parts[1].strip().rstrip('.git')
-                            out['github_repos'].append(f"{owner}/{repo}")
-                except Exception:
+        for u in urls:
+            try:
+                if not u:
                     continue
-            # Deduplicate
-            out['github_repos'] = list(dict.fromkeys(out['github_repos']))
+                p = urlparse(u)
+                if 'github.com' in p.netloc.lower():
+                    parts = [seg for seg in p.path.split('/') if seg]
+                    if len(parts) >= 2:
+                        owner = parts[0].strip()
+                        repo = parts[1].strip().rstrip('.git')
+                        out['github_repos'].append(f"{owner}/{repo}")
+            except Exception:
+                continue
+        out['github_repos'] = list(dict.fromkeys(out['github_repos']))
     except Exception as e:
         print(f"[endpoints] fetch_pypi_metadata failed for {pkg_name}: {e}")
+    PYPI_META_CACHE[key] = out
     return out
 
 
@@ -346,22 +357,37 @@ def deterministic_random(seed_str: str) -> float:
     h = deterministic_hash(seed_str)
     return (h % 10000) / 10000.0
 
-async def query_osv(package: str, ecosystem: str = 'PyPI') -> int:
+async def query_osv(package: str, ecosystem: str = 'PyPI', client: Optional[httpx.AsyncClient] = None) -> int:
     url = "https://api.osv.dev/v1/query"
     body = {"package": {"name": package, "ecosystem": ecosystem}}
+    cache_key = (ecosystem, package.lower().strip())
+    cached = OSV_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
     try:
-        async with httpx.AsyncClient() as client:
-            resp = await client.post(url, json=body, timeout=5.0)
+        close_client = False
+        if client is None:
+            client = httpx.AsyncClient(timeout=5.0)
+            close_client = True
+        try:
+            resp = await client.post(url, json=body)
             if resp.status_code == 200:
                 data = resp.json()
-                return len(data.get('vulns', []))
+                count = len(data.get('vulns', []))
+                OSV_CACHE[cache_key] = count
+                return count
+        finally:
+            if close_client:
+                await client.aclose()
     except Exception as e:
         print(f"[endpoints] query_osv failed for {package}: {e}")
+        OSV_CACHE[cache_key] = 0
         return 0
+    OSV_CACHE[cache_key] = 0
     return 0
 
 @router.get("/graph/{owner}/{repo}", response_model=GraphData)
-async def get_dependency_graph(owner: str, repo: str):
+async def get_dependency_graph(owner: str, repo: str, fresh: bool = False, max_deps: int = 15, expand: bool = False):
     """
     Advanced Risk Analysis Endpoint (Optimized):
     1. Fetches real OpenDigger data using STREAMING (Memory Friendly).
@@ -372,16 +398,25 @@ async def get_dependency_graph(owner: str, repo: str):
     """
     repo_full_name = f"{owner}/{repo}"
     
-    # Invalidate any existing cached result for this repo to ensure we compute
-    # with fresh enrichment data (avoids returning stale star-graph results)
-    # FORCE FRESH CALCULATION per user request
-    if repo_full_name in ANALYSIS_CACHE:
-        ANALYSIS_CACHE.pop(repo_full_name, None)
-    
+    if not fresh and repo_full_name in ANALYSIS_CACHE:
+        return ANALYSIS_CACHE[repo_full_name]
+
+    http_client = httpx.AsyncClient(
+        timeout=8.0,
+        limits=httpx.Limits(max_connections=60, max_keepalive_connections=20),
+    )
+
     # --- 1. Data Collection Phase (Stream Optimized) ---
     # Innovation: Stream Fetch -> Parse -> SQLite -> Destroy
-    activity = await stream_processor.fetch_and_store(repo_full_name, "activity")
-    openrank = await stream_processor.fetch_and_store(repo_full_name, "openrank")
+    activity, openrank = await asyncio.gather(
+        stream_processor.fetch_and_store(repo_full_name, "activity"),
+        stream_processor.fetch_and_store(repo_full_name, "openrank"),
+        return_exceptions=True
+    )
+    if isinstance(activity, Exception):
+        activity = None
+    if isinstance(openrank, Exception):
+        openrank = None
     
     base_score = 0.5
     if activity:
@@ -393,6 +428,7 @@ async def get_dependency_graph(owner: str, repo: str):
     edges_data = []
     # map package name -> node id for enrichment (filled while creating nodes)
     pkg_node_map = {}
+    visited_pkgs = set()
     
     # Root Node
     nodes_data.append({"id": repo_full_name, "risk_score": base_score, "type": "Target", "description": "Target Project"})
@@ -400,10 +436,21 @@ async def get_dependency_graph(owner: str, repo: str):
     # 100% Real Dependency Fetching
     dependencies = []
     ecosystem = None
+
+    async def fetch_deps_recursive(pkg_name: str, depth: int = 0, max_depth: int = 2) -> List[str]:
+        if depth > max_depth or pkg_name.lower() in visited_pkgs:
+            return []
+        visited_pkgs.add(pkg_name.lower())
+        meta = await fetch_pypi_metadata(pkg_name)
+        requires = meta.get('requires', [])
+        sub_deps = []
+        for sub in requires:
+            sub_deps.extend(await fetch_deps_recursive(sub, depth + 1, max_depth))
+        return requires + sub_deps
     
     # Try pyproject.toml (Python modern) first as it is more specific to Python projects
     # This helps avoid misidentifying Python projects as npm if they have a package.json for frontend tools
-    toml_txt = await fetch_repo_file(owner, repo, "pyproject.toml")
+    toml_txt = await fetch_repo_file(owner, repo, "pyproject.toml", client=http_client)
     if toml_txt:
         ecosystem = 'PyPI'
         # IMPROVED PARSER v2: Handles both PEP 621 (lists) and Poetry (tables)
@@ -454,24 +501,24 @@ async def get_dependency_graph(owner: str, repo: str):
 
     if not dependencies:
         # Try requirements.txt (Python) in root and common subfolders
-        req_txt = await fetch_repo_file(owner, repo, "requirements.txt")
+        req_txt = await fetch_repo_file(owner, repo, "requirements.txt", client=http_client)
         if not req_txt:
-            req_txt = await fetch_repo_file(owner, repo, "backend/requirements.txt")
+            req_txt = await fetch_repo_file(owner, repo, "backend/requirements.txt", client=http_client)
         if not req_txt:
-            req_txt = await fetch_repo_file(owner, repo, "api/requirements.txt")
+            req_txt = await fetch_repo_file(owner, repo, "api/requirements.txt", client=http_client)
         if not req_txt:
-            req_txt = await fetch_repo_file(owner, repo, "server/requirements.txt")
+            req_txt = await fetch_repo_file(owner, repo, "server/requirements.txt", client=http_client)
         if req_txt:
             dependencies = parse_dependencies(req_txt, 'txt')
             ecosystem = 'PyPI'
 
     if not dependencies:
         # Try setup.py (Python) - simple check
-        setup_py = await fetch_repo_file(owner, repo, "setup.py")
+        setup_py = await fetch_repo_file(owner, repo, "setup.py", client=http_client)
         if setup_py:
             # We can't easily parse setup.py, but we can identify it as Python
             # Use setup.cfg if available for parsing
-            setup_cfg = await fetch_repo_file(owner, repo, "setup.cfg")
+            setup_cfg = await fetch_repo_file(owner, repo, "setup.cfg", client=http_client)
             if setup_cfg:
                 # Basic ini parsing for install_requires
                 ecosystem = 'PyPI'
@@ -488,7 +535,7 @@ async def get_dependency_graph(owner: str, repo: str):
         # Try package.json (Node.js)
         # FIX: Try raw.githubusercontent.com again as primary, jsDelivr as fallback
         # Some repos structure might be different or jsDelivr might be caching old/missing files
-        pkg_json = await fetch_repo_file(owner, repo, "package.json")
+        pkg_json = await fetch_repo_file(owner, repo, "package.json", client=http_client)
         if pkg_json:
             dependencies = parse_dependencies(pkg_json, 'json')
             ecosystem = 'npm'
@@ -496,20 +543,20 @@ async def get_dependency_graph(owner: str, repo: str):
             # Try finding in root, if fail, try standard mono-repo paths like "packages/react/package.json"
             # React specific fix: React repo is a monorepo, core is in packages/react
             if repo == "react":
-                pkg_json = await fetch_repo_file(owner, repo, "packages/react/package.json")
+                pkg_json = await fetch_repo_file(owner, repo, "packages/react/package.json", client=http_client)
                 if pkg_json:
                     dependencies = parse_dependencies(pkg_json, 'json')
                     ecosystem = 'npm'
             
             if not dependencies:
                 # Try CMakeLists.txt (C/C++) - simplified parsing
-                cmake_txt = await fetch_repo_file(owner, repo, "CMakeLists.txt")
+                cmake_txt = await fetch_repo_file(owner, repo, "CMakeLists.txt", client=http_client)
                 if cmake_txt:
                     # Look for find_package(PackageName)
                     dependencies = re.findall(r'find_package\s*\(\s*([a-zA-Z0-9_]+)', cmake_txt, re.IGNORECASE)
                 else:
                     # Try Makefile (C/C++) - very basic parsing
-                    makefile_txt = await fetch_repo_file(owner, repo, "Makefile")
+                    makefile_txt = await fetch_repo_file(owner, repo, "Makefile", client=http_client)
                     if makefile_txt:
                             # Look for -lLibName (linker flags)
                             dependencies = re.findall(r'-l([a-zA-Z0-9_]+)', makefile_txt)
@@ -541,15 +588,29 @@ async def get_dependency_graph(owner: str, repo: str):
         
     dependencies = filtered_deps
     
-    # Limit graph size for performance (but fetch real data for these)
-    # REVERTED: 50 -> 15 to fix timeout issues
-    dependencies = dependencies[:15] 
+    max_deps = max(1, min(50, int(max_deps)))
+    if expand and ecosystem == 'PyPI' and dependencies:
+        sem = asyncio.Semaphore(8)
+        async def _rec(pkg: str):
+            async with sem:
+                return await fetch_deps_recursive(pkg)
+        rec_results = await asyncio.gather(*[_rec(d) for d in dependencies], return_exceptions=True)
+        recursive_deps = []
+        for r in rec_results:
+            if isinstance(r, Exception) or not r:
+                continue
+            recursive_deps.extend(r)
+        if recursive_deps:
+            dependencies += recursive_deps
+            dependencies = list(dict.fromkeys(dependencies))
+    
+    dependencies = dependencies[:max_deps]
 
     # Fetch Root Node CVEs
     if ecosystem:
         print(f"[endpoints] Querying root CVEs for {repo} in {ecosystem}")
         try:
-            root_cve_count = await query_osv(repo, ecosystem)
+            root_cve_count = await query_osv(repo, ecosystem, client=http_client)
             print(f"[endpoints] Root CVEs: {root_cve_count}")
         except Exception as e:
             print(f"[endpoints] Root CVE query failed: {e}")
@@ -559,26 +620,35 @@ async def get_dependency_graph(owner: str, repo: str):
     
     # Real Data Fetching for Dependencies
     dep_metrics = {}
+    dep_sem = asyncio.Semaphore(10)
+    async def _zero():
+        return 0
     
     async def fetch_dep_metrics(dep_name, ecosystem):
-        mapped_name = resolve_repo_name(dep_name)
-        # Fetch both metrics in parallel for this dependency
-        # IMPORTANT: Use return_exceptions=True to prevent one failure from killing all
-        d_act, d_rank = await asyncio.gather(
-            stream_processor.fetch_and_store(mapped_name, "activity"),
-            stream_processor.fetch_and_store(mapped_name, "openrank"),
-            return_exceptions=True
-        )
-        # Handle exceptions/None
-        if isinstance(d_act, Exception) or not d_act: 
-            # print(f"Failed activity for {mapped_name}: {d_act}")
-            d_act = None
-        if isinstance(d_rank, Exception) or not d_rank: 
-            # print(f"Failed openrank for {mapped_name}: {d_rank}")
-            d_rank = None
-            
-        cve_count = await query_osv(dep_name, ecosystem) if ecosystem else 0
-        return dep_name, mapped_name, d_act, d_rank, cve_count
+        async with dep_sem:
+            mapped_name = resolve_repo_name(dep_name)
+            if ecosystem == 'PyPI' and "/" not in dep_name:
+                meta = await fetch_pypi_metadata(dep_name, client=http_client)
+                repos = meta.get("github_repos") or []
+                if repos:
+                    mapped_name = repos[0]
+
+            cve_task = query_osv(dep_name, ecosystem, client=http_client) if ecosystem else _zero()
+            d_act, d_rank, cve_count = await asyncio.gather(
+                stream_processor.fetch_and_store(mapped_name, "activity"),
+                stream_processor.fetch_and_store(mapped_name, "openrank"),
+                cve_task,
+                return_exceptions=True
+            )
+
+            if isinstance(d_act, Exception) or not d_act:
+                d_act = None
+            if isinstance(d_rank, Exception) or not d_rank:
+                d_rank = None
+            if isinstance(cve_count, Exception) or cve_count is None:
+                cve_count = 0
+
+            return dep_name, mapped_name, d_act, d_rank, int(cve_count)
 
     # Spawn tasks for all dependencies
     # FIX: Ensure we actually wait for them
@@ -702,10 +772,11 @@ async def get_dependency_graph(owner: str, repo: str):
     try:
         if ecosystem == 'PyPI' and dependencies:
             print(f"[endpoints] starting PyPI enrichment for {len(dependencies)} deps")
-            sem = asyncio.Semaphore(6)
+            # OPTIMIZATION: Increased concurrency from 6 to 20 for faster enrichment
+            sem = asyncio.Semaphore(20)
             async def _fetch(pkg):
                 async with sem:
-                    return pkg, await fetch_pypi_metadata(pkg)
+                    return pkg, await fetch_pypi_metadata(pkg, client=http_client)
 
             fetch_tasks = [_fetch(d) for d in dependencies]
             pypi_results = await asyncio.gather(*fetch_tasks, return_exceptions=True)
@@ -898,7 +969,7 @@ async def get_dependency_graph(owner: str, repo: str):
         
         # Description Update
         cve_count = node_obj.get('cve_count', 0)
-        desc_text = f"Risk: {final_risk * 100:.1f} (Propagated) | CVEs: {cve_count}"
+        desc_text = f"Risk: {final_risk * 100:.1f} (Propagated) | CVEs: {cve_count} | Constraint: {constraint_val:.2f}"
         
         # Generate History (Deterministic: flat series based on final risk)
         history = []
@@ -924,6 +995,7 @@ async def get_dependency_graph(owner: str, repo: str):
     # Persist immediately
     save_cache()
     
+    await http_client.aclose()
     return result
 
 @router.post("/compare")
@@ -985,15 +1057,26 @@ async def compare_projects(
             
             cve_count = await query_osv(repo, ecosystem)
             
-            # Risk Calc
-            n_act = min(act_val / 50.0, 1.0) # Normalize activity (50 is high)
-            n_rank = min(rank_val / 100.0, 1.0) # Normalize rank (100 is high)
-            n_cve = min(cve_count / 10.0, 1.0)
+            # Risk Calc (Unified with V4 Algorithm)
+            # 1. Normalize
+            norm_rank = rank_val / (rank_val + 50.0)
+            norm_act = act_val / (act_val + 5.0)
             
-            # V3 Algo: Activity (0.5) > Rank (0.2) for risk reduction
-            base_risk = 0.8 # Higher base to ensure inactive projects stay high risk
-            risk = base_risk - (n_act * 0.5) - (n_rank * 0.2) + (n_cve * 0.2)
-            risk = max(0.0, min(1.0, risk))
+            # 2. Reputation (60% Rank, 40% Activity)
+            reputation = (0.6 * norm_rank) + (0.4 * norm_act)
+            
+            # 3. Base Risk
+            base_risk = (1.0 - reputation) * 0.5
+            
+            # 4. CVE Risk
+            n_cve = min(cve_count / 10.0, 1.0) # Simple normalization for now
+            # Cap CVE impact
+            cve_risk = min(0.4, n_cve * 0.4)
+            # Suppression
+            effective_cve_risk = cve_risk * (1.0 - (reputation * 0.8))
+            
+            risk = base_risk + effective_cve_risk
+            risk = max(0.0, min(0.95, risk))
             
             return {
                 "name": repo_full,
