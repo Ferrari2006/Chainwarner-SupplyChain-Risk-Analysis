@@ -374,6 +374,7 @@ async def get_dependency_graph(owner: str, repo: str):
     
     # Invalidate any existing cached result for this repo to ensure we compute
     # with fresh enrichment data (avoids returning stale star-graph results)
+    # FORCE FRESH CALCULATION per user request
     if repo_full_name in ANALYSIS_CACHE:
         ANALYSIS_CACHE.pop(repo_full_name, None)
     
@@ -525,6 +526,20 @@ async def get_dependency_graph(owner: str, repo: str):
     if not dependencies:
         print(f"[Warning] Failed to fetch dependencies for {repo_full_name}. Graph will be empty.")
         nodes_data[0]['description'] += " | Error: No deps found"
+    
+    # 1. Dependency Filtering: Ignore trivial deps (dev, test, types, etc.)
+    # We keep only "Major" dependencies to reduce noise.
+    filtered_deps = []
+    IGNORED_PREFIXES = ["types-", "test-", "dev-", "my-", "demo-"]
+    IGNORED_NAMES = ["pytest", "black", "flake8", "mypy", "isort", "coverage", "tox", "wheel", "setuptools", "pip"]
+    
+    for d in dependencies:
+        d_lower = d.lower()
+        if any(d_lower.startswith(p) for p in IGNORED_PREFIXES): continue
+        if d_lower in IGNORED_NAMES: continue
+        filtered_deps.append(d)
+        
+    dependencies = filtered_deps
     
     # Limit graph size for performance (but fetch real data for these)
     # REVERTED: 50 -> 15 to fix timeout issues
@@ -799,6 +814,8 @@ async def get_dependency_graph(owner: str, repo: str):
     # User said: "NodeColor = min(SelfScore, min(DependencyScores))" -> He meant Health Score.
     # In Risk Score (High=Bad), this means: NodeRisk = Max(SelfRisk, Max(ChildRisk))
     # We add a slight decay factor (0.9) for indirect dependencies so root isn't always 1.0
+    # BALANCED RISK: Use a gentler propagation to avoid "all red" unless critical.
+    # Decay factor 0.8 ensures distant risks don't overwhelm the root immediately.
     
     adjacency = {n: [] for n in node_list}
     for e in edges_data:
@@ -817,10 +834,10 @@ async def get_dependency_graph(owner: str, repo: str):
             for child_id in children:
                 # If child is in graph
                 if child_id in prop_risk_map:
-                    max_child_risk = max(max_child_risk, prop_risk_map[child_id])
+                    # Apply decay: 0.8 to allow "Orange" layer between Green and Red
+                    max_child_risk = max(max_child_risk, prop_risk_map[child_id] * 0.8)
             
-            # Propagation Logic: Risk = Max(Self, Child * 1.0) -> Strict "Wooden Barrel"
-            # If a dependency is critical (0.9), I am critical (0.9)
+            # Propagation Logic: Risk = Max(Self, Child * 0.8) -> Balanced "Wooden Barrel"
             new_risk = max(current_risk, max_child_risk)
             
             if abs(new_risk - current_risk) > 0.01:
