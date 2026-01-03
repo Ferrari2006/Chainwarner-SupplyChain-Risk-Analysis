@@ -8,19 +8,25 @@ class NLPEngine:
         self.model_path = os.path.join(os.path.dirname(__file__), "nlp_model.joblib")
 
     def _load_model(self):
-        # Try transformers first, then sklearn fallback. If both fail, mark mock.
-        try:
-            from transformers import pipeline
-            self.sentiment_analyzer = pipeline(
-                "text-classification",
-                model="distilbert/distilbert-base-uncased-finetuned-sst-2-english",
-                top_k=None,
-            )
-            self.model_type = 'transformers'
-            print("NLPEngine: loaded transformers pipeline.")
-            return
-        except Exception:
-            pass
+        # MEMORY OPTIMIZATION:
+        # Default to 'mock' or 'sklearn' (Lite Mode) to save RAM on Render (512MB limit).
+        # Only load Transformers if explicitly requested via env var or if resources allow.
+        
+        enable_transformers = os.getenv("ENABLE_TRANSFORMERS", "false").lower() == "true"
+        
+        if enable_transformers:
+            try:
+                from transformers import pipeline
+                self.sentiment_analyzer = pipeline(
+                    "text-classification",
+                    model="distilbert/distilbert-base-uncased-finetuned-sst-2-english",
+                    top_k=None,
+                )
+                self.model_type = 'transformers'
+                print("NLPEngine: loaded transformers pipeline.")
+                return
+            except Exception as e:
+                print(f"NLPEngine: Transformers load failed: {e}")
 
         # Try sklearn fallback (load or train a tiny model)
         try:

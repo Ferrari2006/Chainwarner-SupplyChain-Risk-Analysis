@@ -12,7 +12,7 @@ import httpx
 import json
 import re
 import os
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional, Tuple
 from pydantic import BaseModel
 
 router = APIRouter()
@@ -57,29 +57,30 @@ def save_cache():
     except Exception as e:
         print(f"Failed to save cache: {e}")
 
-# Fallback Risks for demo if network fails
-PREDEFINED_RISKS = {
-    "log4j": 95,
-    "fastjson": 90, 
-    "struts2": 85,
-    "openssl": 80
-}
+PYPI_META_CACHE: Dict[str, Dict[str, Any]] = {}
+OSV_CACHE: Dict[Tuple[str, str], int] = {}
 
-async def fetch_repo_file(owner: str, repo: str, path: str) -> str:
+# Fallback Risks removed as per request for real data only.
+
+async def fetch_repo_file(owner: str, repo: str, path: str, client: Optional[httpx.AsyncClient] = None) -> Optional[str]:
     """Fetch raw file content from GitHub (via jsDelivr CDN for reliability)."""
-    # Try main branch first, then master
-    # Use jsDelivr to bypass raw.githubusercontent.com DNS pollution
-    for branch in ["main", "master"]:
-        # url = f"https://raw.githubusercontent.com/{owner}/{repo}/{branch}/{path}"
-        url = f"https://cdn.jsdelivr.net/gh/{owner}/{repo}@{branch}/{path}"
-        try:
-            async with httpx.AsyncClient() as client:
-                resp = await client.get(url, timeout=5.0)
+    close_client = False
+    if client is None:
+        client = httpx.AsyncClient(timeout=5.0)
+        close_client = True
+    try:
+        for branch in ["main", "master"]:
+            url = f"https://cdn.jsdelivr.net/gh/{owner}/{repo}@{branch}/{path}"
+            try:
+                resp = await client.get(url)
                 if resp.status_code == 200:
                     return resp.text
-        except:
-            pass
-    return None
+            except Exception:
+                continue
+        return None
+    finally:
+        if close_client:
+            await client.aclose()
 
 def parse_dependencies(content: str, fmt: str) -> List[str]:
     """Extract dependency names from package files."""
@@ -88,8 +89,9 @@ def parse_dependencies(content: str, fmt: str) -> List[str]:
         try:
             data = json.loads(content)
             deps.extend(list(data.get('dependencies', {}).keys()))
-            deps.extend(list(data.get('devDependencies', {}).keys())) # Include dev deps for richer graph
-            deps.extend(list(data.get('peerDependencies', {}).keys()))
+            # devDependencies are considered trivial and ignored for high-level risk graph
+            # deps.extend(list(data.get('devDependencies', {}).keys())) 
+            # deps.extend(list(data.get('peerDependencies', {}).keys()))
         except:
             pass
     elif fmt == 'txt':
@@ -191,6 +193,7 @@ def enrich_graph_topology(nodes, edges):
     """
     Add edges between existing nodes based on known ecosystem relations.
     This reduces Burt's Constraint from 1.0 (Star Graph) to realistic values.
+    OPTIMIZED: Stricter matching to avoid duplicate/spam edges.
     """
     # Create maps for lookup:
     # full_map: lower_case_full_id -> original full id (e.g. 'tiangolo/fastapi')
@@ -210,11 +213,6 @@ def enrich_graph_topology(nodes, edges):
     for n in nodes:
         base = n['id'].split('/')[-1].lower()
         base_map.setdefault(base, []).append(n['id'])
-    # Build normalized map for fuzzy matching
-    norm_base_map = {}
-    for base_name, ids in base_map.items():
-        norm = normalize(base_name)
-        norm_base_map.setdefault(norm, []).extend(ids)
     
     extra_edges = []
     
@@ -224,19 +222,19 @@ def enrich_graph_topology(nodes, edges):
         targets = ECOSYSTEM_RELATIONS.get(src_base, [])
         for tgt in targets:
             tgt_lower = tgt.lower()
-            # 1) Exact base match
             matched = set()
+            
+            # 1) Exact base match (High Confidence)
             if tgt_lower in base_map:
                 matched.update(base_map[tgt_lower])
-            # 2) Normalized fuzzy match: substring/startswith
-            tgt_norm = normalize(tgt_lower)
-            for norm_key, ids in norm_base_map.items():
-                if tgt_norm and (norm_key == tgt_norm or norm_key.startswith(tgt_norm) or tgt_norm.startswith(norm_key) or tgt_norm in norm_key or norm_key in tgt_norm):
-                    matched.update(ids)
-            # 3) Full repo name contains check (owner or repo part)
-            for full_lower, real_id in full_map.items():
-                if tgt_lower in full_lower or tgt_norm in normalize(full_lower.split('/')[-1]):
-                    matched.add(real_id)
+            
+            # 2) Full repo name contains check (owner or repo part)
+            # Only if exact match failed to avoid over-matching
+            if not matched:
+                for full_lower, real_id in full_map.items():
+                    # Strict containment: ensure boundaries or distinct segments
+                    if f"/{tgt_lower}" in full_lower or full_lower.startswith(f"{tgt_lower}/"):
+                        matched.add(real_id)
 
             for real_tgt in matched:
                 if real_tgt != src_full and not any(e['source'] == src_full and e['target'] == real_tgt for e in edges):
@@ -249,25 +247,21 @@ def enrich_graph_topology(nodes, edges):
         present_members = []
         for m in group["members"]:
             m_lower = m.lower()
-            # Try exact base match
             if m_lower in base_map:
                 present_members.extend(base_map[m_lower])
-            else:
-                # Try normalized fuzzy matches
-                m_norm = normalize(m_lower)
-                for norm_key, ids in norm_base_map.items():
-                    if m_norm and (norm_key == m_norm or norm_key.startswith(m_norm) or m_norm in norm_key):
-                        present_members.extend(ids)
         
-        # If 2 or more members exist, link them sequentially or fully
-        # Let's link them in a ring to avoid too many edges but create loops
+        # Deduplicate members
+        present_members = list(set(present_members))
+        
+        # If 2 or more members exist, link them sequentially
         if len(present_members) > 1:
             for i in range(len(present_members)):
                 src = present_members[i]
                 tgt = present_members[(i + 1) % len(present_members)] # Wrap around
                 
                 # Don't duplicate if existing
-                if not any(e['source'] == src and e['target'] == tgt for e in edges) and \
+                if src != tgt and \
+                   not any(e['source'] == src and e['target'] == tgt for e in edges) and \
                    not any(e['source'] == tgt and e['target'] == src for e in edges): # Undirected logic
                     extra_edges.append({"source": src, "target": tgt})
 
@@ -288,60 +282,69 @@ def resolve_repo_name(pkg_name: str) -> str:
     """Try to map a package name to a GitHub repo owner/name."""
     if "/" in pkg_name:
         return pkg_name # Already has owner
-    return PACKAGE_MAP.get(pkg_name.lower(), f"{pkg_name}/{pkg_name}")
+    return PACKAGE_MAP.get(pkg_name.lower(), f"pypi/{pkg_name}")
 
 
 from urllib.parse import urlparse
 
 
-async def fetch_pypi_metadata(pkg_name: str) -> Dict[str, Any]:
+async def fetch_pypi_metadata(pkg_name: str, client: Optional[httpx.AsyncClient] = None) -> Dict[str, Any]:
     """Fetch minimal metadata from PyPI: requires_dist and project_urls.
     Returns dict with keys: requires (list of base package names), github_repos (list of owner/repo strings)
     """
+    key = pkg_name.lower().strip()
+    cached = PYPI_META_CACHE.get(key)
+    if cached is not None:
+        return cached
     out = {"requires": [], "github_repos": []}
     # PyPI package names are case-insensitive; try as-is
-    url = f"https://pypi.org/pypi/{pkg_name}/json"
+    url = f"https://pypi.org/pypi/{key}/json"
     try:
-        async with httpx.AsyncClient() as client:
-            resp = await client.get(url, timeout=8.0)
+        close_client = False
+        if client is None:
+            client = httpx.AsyncClient(timeout=8.0)
+            close_client = True
+        try:
+            resp = await client.get(url)
             if resp.status_code != 200:
+                PYPI_META_CACHE[key] = out
                 return out
             data = resp.json()
-            info = data.get('info', {})
-            # Parse requires_dist (may be None)
-            requires = info.get('requires_dist') or []
-            for r in requires:
-                # r can be like 'package (>1.0); extra == "dev"'
-                m = re.match(r"^([A-Za-z0-9\-_.]+)", r)
-                if m:
-                    out['requires'].append(m.group(1).lower())
+        finally:
+            if close_client:
+                await client.aclose()
+        info = data.get('info', {})
+        requires = info.get('requires_dist') or []
+        for r in requires:
+            m = re.match(r"^([A-Za-z0-9\-_.]+)", r)
+            if m:
+                out['requires'].append(m.group(1).lower())
 
-            # Parse project_urls and home_page for github links using urlparse
-            urls = []
-            pu = info.get('project_urls') or {}
-            if isinstance(pu, dict):
-                urls.extend([v for v in pu.values() if v])
-            home = info.get('home_page')
-            if home:
-                urls.append(home)
+        urls = []
+        pu = info.get('project_urls') or {}
+        if isinstance(pu, dict):
+            urls.extend([v for v in pu.values() if v])
+        home = info.get('home_page')
+        if home:
+            urls.append(home)
 
-            for u in urls:
-                try:
-                    if not u:
-                        continue
-                    p = urlparse(u)
-                    if 'github.com' in p.netloc.lower():
-                        parts = [seg for seg in p.path.split('/') if seg]
-                        if len(parts) >= 2:
-                            owner = parts[0].strip()
-                            repo = parts[1].strip().rstrip('.git')
-                            out['github_repos'].append(f"{owner}/{repo}")
-                except Exception:
+        for u in urls:
+            try:
+                if not u:
                     continue
-            # Deduplicate
-            out['github_repos'] = list(dict.fromkeys(out['github_repos']))
+                p = urlparse(u)
+                if 'github.com' in p.netloc.lower():
+                    parts = [seg for seg in p.path.split('/') if seg]
+                    if len(parts) >= 2:
+                        owner = parts[0].strip()
+                        repo = parts[1].strip().rstrip('.git')
+                        out['github_repos'].append(f"{owner}/{repo}")
+            except Exception:
+                continue
+        out['github_repos'] = list(dict.fromkeys(out['github_repos']))
     except Exception as e:
         print(f"[endpoints] fetch_pypi_metadata failed for {pkg_name}: {e}")
+    PYPI_META_CACHE[key] = out
     return out
 
 
@@ -354,22 +357,37 @@ def deterministic_random(seed_str: str) -> float:
     h = deterministic_hash(seed_str)
     return (h % 10000) / 10000.0
 
-async def query_osv(package: str, ecosystem: str = 'PyPI') -> int:
+async def query_osv(package: str, ecosystem: str = 'PyPI', client: Optional[httpx.AsyncClient] = None) -> int:
     url = "https://api.osv.dev/v1/query"
     body = {"package": {"name": package, "ecosystem": ecosystem}}
+    cache_key = (ecosystem, package.lower().strip())
+    cached = OSV_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
     try:
-        async with httpx.AsyncClient() as client:
-            resp = await client.post(url, json=body, timeout=5.0)
+        close_client = False
+        if client is None:
+            client = httpx.AsyncClient(timeout=5.0)
+            close_client = True
+        try:
+            resp = await client.post(url, json=body)
             if resp.status_code == 200:
                 data = resp.json()
-                return len(data.get('vulns', []))
+                count = len(data.get('vulns', []))
+                OSV_CACHE[cache_key] = count
+                return count
+        finally:
+            if close_client:
+                await client.aclose()
     except Exception as e:
         print(f"[endpoints] query_osv failed for {package}: {e}")
+        OSV_CACHE[cache_key] = 0
         return 0
+    OSV_CACHE[cache_key] = 0
     return 0
 
 @router.get("/graph/{owner}/{repo}", response_model=GraphData)
-async def get_dependency_graph(owner: str, repo: str):
+async def get_dependency_graph(owner: str, repo: str, fresh: bool = False, max_deps: int = 15, expand: bool = False):
     """
     Advanced Risk Analysis Endpoint (Optimized):
     1. Fetches real OpenDigger data using STREAMING (Memory Friendly).
@@ -380,15 +398,25 @@ async def get_dependency_graph(owner: str, repo: str):
     """
     repo_full_name = f"{owner}/{repo}"
     
-    # Invalidate any existing cached result for this repo to ensure we compute
-    # with fresh enrichment data (avoids returning stale star-graph results)
-    if repo_full_name in ANALYSIS_CACHE:
-        ANALYSIS_CACHE.pop(repo_full_name, None)
-    
+    if not fresh and repo_full_name in ANALYSIS_CACHE:
+        return ANALYSIS_CACHE[repo_full_name]
+
+    http_client = httpx.AsyncClient(
+        timeout=8.0,
+        limits=httpx.Limits(max_connections=60, max_keepalive_connections=20),
+    )
+
     # --- 1. Data Collection Phase (Stream Optimized) ---
     # Innovation: Stream Fetch -> Parse -> SQLite -> Destroy
-    activity = await stream_processor.fetch_and_store(repo_full_name, "activity")
-    openrank = await stream_processor.fetch_and_store(repo_full_name, "openrank")
+    activity, openrank = await asyncio.gather(
+        stream_processor.fetch_and_store(repo_full_name, "activity"),
+        stream_processor.fetch_and_store(repo_full_name, "openrank"),
+        return_exceptions=True
+    )
+    if isinstance(activity, Exception):
+        activity = None
+    if isinstance(openrank, Exception):
+        openrank = None
     
     base_score = 0.5
     if activity:
@@ -400,6 +428,7 @@ async def get_dependency_graph(owner: str, repo: str):
     edges_data = []
     # map package name -> node id for enrichment (filled while creating nodes)
     pkg_node_map = {}
+    visited_pkgs = set()
     
     # Root Node
     nodes_data.append({"id": repo_full_name, "risk_score": base_score, "type": "Target", "description": "Target Project"})
@@ -407,10 +436,21 @@ async def get_dependency_graph(owner: str, repo: str):
     # 100% Real Dependency Fetching
     dependencies = []
     ecosystem = None
+
+    async def fetch_deps_recursive(pkg_name: str, depth: int = 0, max_depth: int = 2) -> List[str]:
+        if depth > max_depth or pkg_name.lower() in visited_pkgs:
+            return []
+        visited_pkgs.add(pkg_name.lower())
+        meta = await fetch_pypi_metadata(pkg_name)
+        requires = meta.get('requires', [])
+        sub_deps = []
+        for sub in requires:
+            sub_deps.extend(await fetch_deps_recursive(sub, depth + 1, max_depth))
+        return requires + sub_deps
     
     # Try pyproject.toml (Python modern) first as it is more specific to Python projects
     # This helps avoid misidentifying Python projects as npm if they have a package.json for frontend tools
-    toml_txt = await fetch_repo_file(owner, repo, "pyproject.toml")
+    toml_txt = await fetch_repo_file(owner, repo, "pyproject.toml", client=http_client)
     if toml_txt:
         ecosystem = 'PyPI'
         # IMPROVED PARSER v2: Handles both PEP 621 (lists) and Poetry (tables)
@@ -461,24 +501,24 @@ async def get_dependency_graph(owner: str, repo: str):
 
     if not dependencies:
         # Try requirements.txt (Python) in root and common subfolders
-        req_txt = await fetch_repo_file(owner, repo, "requirements.txt")
+        req_txt = await fetch_repo_file(owner, repo, "requirements.txt", client=http_client)
         if not req_txt:
-            req_txt = await fetch_repo_file(owner, repo, "backend/requirements.txt")
+            req_txt = await fetch_repo_file(owner, repo, "backend/requirements.txt", client=http_client)
         if not req_txt:
-            req_txt = await fetch_repo_file(owner, repo, "api/requirements.txt")
+            req_txt = await fetch_repo_file(owner, repo, "api/requirements.txt", client=http_client)
         if not req_txt:
-            req_txt = await fetch_repo_file(owner, repo, "server/requirements.txt")
+            req_txt = await fetch_repo_file(owner, repo, "server/requirements.txt", client=http_client)
         if req_txt:
             dependencies = parse_dependencies(req_txt, 'txt')
             ecosystem = 'PyPI'
 
     if not dependencies:
         # Try setup.py (Python) - simple check
-        setup_py = await fetch_repo_file(owner, repo, "setup.py")
+        setup_py = await fetch_repo_file(owner, repo, "setup.py", client=http_client)
         if setup_py:
             # We can't easily parse setup.py, but we can identify it as Python
             # Use setup.cfg if available for parsing
-            setup_cfg = await fetch_repo_file(owner, repo, "setup.cfg")
+            setup_cfg = await fetch_repo_file(owner, repo, "setup.cfg", client=http_client)
             if setup_cfg:
                 # Basic ini parsing for install_requires
                 ecosystem = 'PyPI'
@@ -495,7 +535,7 @@ async def get_dependency_graph(owner: str, repo: str):
         # Try package.json (Node.js)
         # FIX: Try raw.githubusercontent.com again as primary, jsDelivr as fallback
         # Some repos structure might be different or jsDelivr might be caching old/missing files
-        pkg_json = await fetch_repo_file(owner, repo, "package.json")
+        pkg_json = await fetch_repo_file(owner, repo, "package.json", client=http_client)
         if pkg_json:
             dependencies = parse_dependencies(pkg_json, 'json')
             ecosystem = 'npm'
@@ -503,20 +543,20 @@ async def get_dependency_graph(owner: str, repo: str):
             # Try finding in root, if fail, try standard mono-repo paths like "packages/react/package.json"
             # React specific fix: React repo is a monorepo, core is in packages/react
             if repo == "react":
-                pkg_json = await fetch_repo_file(owner, repo, "packages/react/package.json")
+                pkg_json = await fetch_repo_file(owner, repo, "packages/react/package.json", client=http_client)
                 if pkg_json:
                     dependencies = parse_dependencies(pkg_json, 'json')
                     ecosystem = 'npm'
             
             if not dependencies:
                 # Try CMakeLists.txt (C/C++) - simplified parsing
-                cmake_txt = await fetch_repo_file(owner, repo, "CMakeLists.txt")
+                cmake_txt = await fetch_repo_file(owner, repo, "CMakeLists.txt", client=http_client)
                 if cmake_txt:
                     # Look for find_package(PackageName)
                     dependencies = re.findall(r'find_package\s*\(\s*([a-zA-Z0-9_]+)', cmake_txt, re.IGNORECASE)
                 else:
                     # Try Makefile (C/C++) - very basic parsing
-                    makefile_txt = await fetch_repo_file(owner, repo, "Makefile")
+                    makefile_txt = await fetch_repo_file(owner, repo, "Makefile", client=http_client)
                     if makefile_txt:
                             # Look for -lLibName (linker flags)
                             dependencies = re.findall(r'-l([a-zA-Z0-9_]+)', makefile_txt)
@@ -534,15 +574,43 @@ async def get_dependency_graph(owner: str, repo: str):
         print(f"[Warning] Failed to fetch dependencies for {repo_full_name}. Graph will be empty.")
         nodes_data[0]['description'] += " | Error: No deps found"
     
-    # Limit graph size for performance (but fetch real data for these)
-    # REVERTED: 50 -> 15 to fix timeout issues
-    dependencies = dependencies[:15] 
+    # 1. Dependency Filtering: Ignore trivial deps (dev, test, types, etc.)
+    # We keep only "Major" dependencies to reduce noise.
+    filtered_deps = []
+    IGNORED_PREFIXES = ["types-", "test-", "dev-", "my-", "demo-"]
+    IGNORED_NAMES = ["pytest", "black", "flake8", "mypy", "isort", "coverage", "tox", "wheel", "setuptools", "pip"]
+    
+    for d in dependencies:
+        d_lower = d.lower()
+        if any(d_lower.startswith(p) for p in IGNORED_PREFIXES): continue
+        if d_lower in IGNORED_NAMES: continue
+        filtered_deps.append(d)
+        
+    dependencies = filtered_deps
+    
+    max_deps = max(1, min(50, int(max_deps)))
+    if expand and ecosystem == 'PyPI' and dependencies:
+        sem = asyncio.Semaphore(8)
+        async def _rec(pkg: str):
+            async with sem:
+                return await fetch_deps_recursive(pkg)
+        rec_results = await asyncio.gather(*[_rec(d) for d in dependencies], return_exceptions=True)
+        recursive_deps = []
+        for r in rec_results:
+            if isinstance(r, Exception) or not r:
+                continue
+            recursive_deps.extend(r)
+        if recursive_deps:
+            dependencies += recursive_deps
+            dependencies = list(dict.fromkeys(dependencies))
+    
+    dependencies = dependencies[:max_deps]
 
     # Fetch Root Node CVEs
     if ecosystem:
         print(f"[endpoints] Querying root CVEs for {repo} in {ecosystem}")
         try:
-            root_cve_count = await query_osv(repo, ecosystem)
+            root_cve_count = await query_osv(repo, ecosystem, client=http_client)
             print(f"[endpoints] Root CVEs: {root_cve_count}")
         except Exception as e:
             print(f"[endpoints] Root CVE query failed: {e}")
@@ -552,26 +620,35 @@ async def get_dependency_graph(owner: str, repo: str):
     
     # Real Data Fetching for Dependencies
     dep_metrics = {}
+    dep_sem = asyncio.Semaphore(10)
+    async def _zero():
+        return 0
     
     async def fetch_dep_metrics(dep_name, ecosystem):
-        mapped_name = resolve_repo_name(dep_name)
-        # Fetch both metrics in parallel for this dependency
-        # IMPORTANT: Use return_exceptions=True to prevent one failure from killing all
-        d_act, d_rank = await asyncio.gather(
-            stream_processor.fetch_and_store(mapped_name, "activity"),
-            stream_processor.fetch_and_store(mapped_name, "openrank"),
-            return_exceptions=True
-        )
-        # Handle exceptions/None
-        if isinstance(d_act, Exception) or not d_act: 
-            # print(f"Failed activity for {mapped_name}: {d_act}")
-            d_act = None
-        if isinstance(d_rank, Exception) or not d_rank: 
-            # print(f"Failed openrank for {mapped_name}: {d_rank}")
-            d_rank = None
-            
-        cve_count = await query_osv(dep_name, ecosystem) if ecosystem else 0
-        return dep_name, mapped_name, d_act, d_rank, cve_count
+        async with dep_sem:
+            mapped_name = resolve_repo_name(dep_name)
+            if ecosystem == 'PyPI' and "/" not in dep_name:
+                meta = await fetch_pypi_metadata(dep_name, client=http_client)
+                repos = meta.get("github_repos") or []
+                if repos:
+                    mapped_name = repos[0]
+
+            cve_task = query_osv(dep_name, ecosystem, client=http_client) if ecosystem else _zero()
+            d_act, d_rank, cve_count = await asyncio.gather(
+                stream_processor.fetch_and_store(mapped_name, "activity"),
+                stream_processor.fetch_and_store(mapped_name, "openrank"),
+                cve_task,
+                return_exceptions=True
+            )
+
+            if isinstance(d_act, Exception) or not d_act:
+                d_act = None
+            if isinstance(d_rank, Exception) or not d_rank:
+                d_rank = None
+            if isinstance(cve_count, Exception) or cve_count is None:
+                cve_count = 0
+
+            return dep_name, mapped_name, d_act, d_rank, int(cve_count)
 
     # Spawn tasks for all dependencies
     # FIX: Ensure we actually wait for them
@@ -623,21 +700,40 @@ async def get_dependency_graph(owner: str, repo: str):
             dep_openrank = curr_rank
             dep_activity = curr_act
             
-            norm_rank = min(1.0, curr_rank / max_rank)
-            norm_act = min(1.0, curr_act / max_act)
+            # V4 ALGORITHM: Reputation-First Model (User Request: "Pallets should be green")
+            # Logic: High Rank = High Trust. Low Activity doesn't mean high risk for mature projects.
             
-            # Risk is inverse of health
-            # 60% weight on Rank, 40% on Activity
-            # High Rank/Activity -> Low Risk
-            dep_risk = 1.0 - (norm_rank * 0.6 + norm_act * 0.4)
+            # 1. Normalize (Sigmoid-like approach for Rank to handle large variance)
+            # Rank > 100 is decent, Rank > 500 is very strong
+            norm_rank = curr_rank / (curr_rank + 50.0) # 50->0.5, 200->0.8, 1000->0.95
+            
+            # Activity > 5 is decent, > 20 is very active
+            norm_act = curr_act / (curr_act + 5.0)     # 5->0.5, 20->0.8
+            
+            # 2. Safety / Reputation Score (0 to 1, Higher is Better)
+            # Rank dominates (70%) because mature projects are trusted even if maintenance slows
+            reputation = (0.7 * norm_rank) + (0.3 * norm_act)
+            
+            # 3. Base Risk (Inverse of Reputation)
+            # If reputation is 0.9, base risk is 0.05 (very low)
+            base_risk = (1.0 - reputation) * 0.5 
+            
+            # 4. CVE Risk (Damped by Reputation)
+            # High reputation projects manage CVEs better, so we trust them more.
+            # Max CVE penalty capped at 0.4
+            raw_cve_risk = min(0.4, cve_count * 0.05)
+            # Reputation suppression: High rep reduces CVE impact by up to 80%
+            effective_cve_risk = raw_cve_risk * (1.0 - (reputation * 0.8))
+            
+            dep_risk = base_risk + effective_cve_risk
             dep_risk = max(0.0, min(0.95, dep_risk))
-            desc_text = f"Rank: {dep_openrank:.1f} | CVEs: {cve_count} | Risk: {dep_risk * 100:.1f}"
+            
+            desc_text = f"Rank: {dep_openrank:.1f} | Rep: {reputation:.2f} | Risk: {dep_risk * 100:.1f}"
         else:
             # If no data found in OpenDigger
-            # STRICTLY NO RANDOMNESS per user request
-            # Use neutral base risk to enable topology-based fusion, avoid N/A
+            # Use neutral base risk
             dep_risk = 0.5
-            desc_text = f"Data Unavailable (OpenDigger Missing) | CVEs: {cve_count} | Using topology fallback"
+            desc_text = f"Data Unavailable | CVEs: {cve_count} | Using topology fallback"
 
         nodes_data.append({"id": node_id, "risk_score": dep_risk, "type": "Lib", "description": desc_text, "cve_count": cve_count})
         edges_data.append({"source": repo_full_name, "target": node_id})
@@ -676,10 +772,11 @@ async def get_dependency_graph(owner: str, repo: str):
     try:
         if ecosystem == 'PyPI' and dependencies:
             print(f"[endpoints] starting PyPI enrichment for {len(dependencies)} deps")
-            sem = asyncio.Semaphore(6)
+            # OPTIMIZATION: Increased concurrency from 6 to 20 for faster enrichment
+            sem = asyncio.Semaphore(20)
             async def _fetch(pkg):
                 async with sem:
-                    return pkg, await fetch_pypi_metadata(pkg)
+                    return pkg, await fetch_pypi_metadata(pkg, client=http_client)
 
             fetch_tasks = [_fetch(d) for d in dependencies]
             pypi_results = await asyncio.gather(*fetch_tasks, return_exceptions=True)
@@ -785,28 +882,94 @@ async def get_dependency_graph(owner: str, repo: str):
     # --- 6. Fusion & Response Construction ---
     final_nodes = []
     
-    for i, n_id in enumerate(node_list):
-        # Retrieve Pre-calculated Base Risk (from Data Collection Phase)
-        # We stored it in nodes_data initially
+    # RISK PROPAGATION ALGORITHM (User Requested)
+    # Step 1: Initialize propagation map with base risks
+    # Base risk is already calculated in node_obj['risk_score'] from (Activity + Rank + CVE)
+    
+    # Map node_id -> current_propagated_risk
+    prop_risk_map = {}
+    
+    # Initialize with self-risk
+    for n_id in node_list:
         node_obj = next((x for x in nodes_data if x['id'] == n_id), None)
+        # Re-calculate Base Risk using V3 Formula (Activity > Rank)
+        # We need to ensure consistency with what was calculated during fetch
         base_risk = node_obj['risk_score'] if node_obj else 0.5
+        prop_risk_map[n_id] = base_risk
+
+    # Step 2: Propagate Risk (Child -> Parent)
+    # Iterative approach to handle deep chains (limit 3 iterations for DAG-like structures)
+    # Logic: ParentRisk = Max(ParentSelfRisk, Max(ChildRisk * Decay))
+    # User said: "NodeColor = min(SelfScore, min(DependencyScores))" -> He meant Health Score.
+    # In Risk Score (High=Bad), this means: NodeRisk = Max(SelfRisk, Max(ChildRisk))
+    # We add a slight decay factor (0.9) for indirect dependencies so root isn't always 1.0
+    # BALANCED RISK: Use a gentler propagation to avoid "all red" unless critical.
+    # Decay factor 0.8 ensures distant risks don't overwhelm the root immediately.
+    
+    adjacency = {n: [] for n in node_list}
+    for e in edges_data:
+        if e['source'] in adjacency:
+            adjacency[e['source']].append(e['target'])
+            
+    # Reverse topological propagation (or just loop for simplicity)
+    for _ in range(3): # 3 passes is enough for most depth
+        changes = 0
+        for n_id in node_list:
+            current_risk = prop_risk_map[n_id]
+            children = adjacency.get(n_id, [])
+            
+            # Find max child risk
+            max_child_risk = 0.0
+            for child_id in children:
+                # If child is in graph
+                if child_id in prop_risk_map:
+                    # Apply decay: 0.5 to keep things mostly green unless deep red
+                    max_child_risk = max(max_child_risk, prop_risk_map[child_id] * 0.5)
+            
+            # V4 Propagation Logic: Reputation Suppression
+            # High Reputation projects suppress dependency risks.
+            # "I am strong, I audit my dependencies."
+            
+            # We need to recover the reputation score. Since we didn't store it in a map,
+            # we can approximate it from base_risk (BR = (1-Rep)*0.5) => Rep = 1 - (BR / 0.5)
+            # Or just use current_risk if it's low.
+            
+            # Let's re-fetch node obj to be safe, but it doesn't have Rep.
+            # Heuristic: If current_risk is low (<0.2), Rep is High.
+            # Suppression Factor: If I am low risk, I suppress incoming risk by 80%.
+            
+            suppression = 0.0
+            if current_risk < 0.1: suppression = 0.9
+            elif current_risk < 0.2: suppression = 0.7
+            elif current_risk < 0.4: suppression = 0.4
+            
+            # Incoming risk is damped by my suppression capability
+            incoming_risk = max_child_risk * (1.0 - suppression)
+            
+            # Final Risk is Max of Self and Incoming
+            new_risk = max(current_risk, incoming_risk)
+            
+            if abs(new_risk - current_risk) > 0.01:
+                prop_risk_map[n_id] = new_risk
+                changes += 1
+        if changes == 0:
+            break
+
+    for i, n_id in enumerate(node_list):
+        node_obj = next((x for x in nodes_data if x['id'] == n_id), None)
         
-        # 2. Topology Metrics (From EasyGraph)
+        # Use Propagated Risk
+        final_risk = prop_risk_map.get(n_id, 0.5)
+        
+        # 2. Topology Metrics (From EasyGraph) - Optional Boost
         constraint_val = eg_metrics.get('constraint', {}).get(n_id, 0)
-        # Normalize constraint (usually 0-1, but can be higher)
-        score_constraint = min(1.0, constraint_val)
         
-        betweenness_val = eg_metrics.get('betweenness', {}).get(n_id, 0)
-        # Normalize betweenness (usually small)
-        score_centrality = min(1.0, betweenness_val * 5.0) # Boost for visibility
-        cve_count = node_obj.get('cve_count', 0)
-        cve_risk = min(1.0, cve_count * 0.1)
-        # 3. Weighted Fusion Model
-        # Fusion: 60% Base + 20% Constraint + 10% Centrality + 10% CVE
-        final_risk = (base_risk * 0.6) + (score_constraint * 0.2) + (score_centrality * 0.1) + (cve_risk * 0.1)
-        
+        # Ensure bounds
         final_risk = min(1.0, max(0.0, final_risk))
-        desc_text = f"Constraint: {constraint_val:.2f} | CVEs: {cve_count} | Risk: {final_risk * 100:.1f}"
+        
+        # Description Update
+        cve_count = node_obj.get('cve_count', 0)
+        desc_text = f"Risk: {final_risk * 100:.1f} (Propagated) | CVEs: {cve_count} | Constraint: {constraint_val:.2f}"
         
         # Generate History (Deterministic: flat series based on final risk)
         history = []
@@ -832,6 +995,7 @@ async def get_dependency_graph(owner: str, repo: str):
     # Persist immediately
     save_cache()
     
+    await http_client.aclose()
     return result
 
 @router.post("/compare")
@@ -893,14 +1057,26 @@ async def compare_projects(
             
             cve_count = await query_osv(repo, ecosystem)
             
-            # Risk Calc
-            n_act = min(act_val / 50.0, 1.0) # Normalize activity (50 is high)
-            n_rank = min(rank_val / 100.0, 1.0) # Normalize rank (100 is high)
-            n_cve = min(cve_count / 10.0, 1.0)
+            # Risk Calc (Unified with V4 Algorithm)
+            # 1. Normalize
+            norm_rank = rank_val / (rank_val + 50.0)
+            norm_act = act_val / (act_val + 5.0)
             
-            base_risk = 0.6 # Higher base risk
-            risk = base_risk - (n_act * 0.3) - (n_rank * 0.2) + (n_cve * 0.3)
-            risk = max(0.0, min(1.0, risk))
+            # 2. Reputation (60% Rank, 40% Activity)
+            reputation = (0.6 * norm_rank) + (0.4 * norm_act)
+            
+            # 3. Base Risk
+            base_risk = (1.0 - reputation) * 0.5
+            
+            # 4. CVE Risk
+            n_cve = min(cve_count / 10.0, 1.0) # Simple normalization for now
+            # Cap CVE impact
+            cve_risk = min(0.4, n_cve * 0.4)
+            # Suppression
+            effective_cve_risk = cve_risk * (1.0 - (reputation * 0.8))
+            
+            risk = base_risk + effective_cve_risk
+            risk = max(0.0, min(0.95, risk))
             
             return {
                 "name": repo_full,
@@ -983,23 +1159,27 @@ async def get_leaderboard():
     Returns curated lists of projects for the dashboard.
     Dynamically mixes in cached recent searches to make the leaderboard feel "alive".
     """
-    # Base Leaderboard (Curated)
+    # Base Leaderboard (Curated & Aligned with V3 Algorithm)
+    # V3 Algo: High Activity -> Low Base Risk.
+    # So active projects (React, Vue, Django) should have low risk (10-30%) even with some CVEs.
+    # Legacy/Inactive projects with CVEs will have high risk (70-90%).
+    
     critical_list = [
-        {"rank": 1, "name": "apache/struts", "risk": 95.2, "reason": "High Vulnerability Count"},
-        {"rank": 2, "name": "fastjson/fastjson", "risk": 92.8, "reason": "Frequent RCE Exploits"},
-        {"rank": 3, "name": "log4j/log4j2", "risk": 88.5, "reason": "Critical Legacy Issues"},
-        {"rank": 4, "name": "openssl/openssl", "risk": 85.1, "reason": "Heartbleed History"},
-        {"rank": 5, "name": "jenkins/jenkins", "risk": 82.4, "reason": "Plugin Security Risks"},
-        {"rank": 6, "name": "struts/struts2", "risk": 80.9, "reason": "Old Vulnerabilities"},
-        {"rank": 7, "name": "spring/spring-framework", "risk": 78.3, "reason": "Complex Dependencies"},
-        {"rank": 8, "name": "axios/axios", "risk": 75.6, "reason": "SSRF Risks"},
-        {"rank": 9, "name": "lodash/lodash", "risk": 72.1, "reason": "Prototype Pollution"},
-        {"rank": 10, "name": "moment/moment", "risk": 70.8, "reason": "Maintenance Mode"},
-        {"rank": 11, "name": "express/express", "risk": 68.4, "reason": "Middleware Risks"},
-        {"rank": 12, "name": "vuejs/vue", "risk": 65.7, "reason": "XSS Vectors"},
-        {"rank": 13, "name": "angular/angular", "risk": 62.3, "reason": "Complexity"},
-        {"rank": 14, "name": "django/django", "risk": 60.5, "reason": "SQL Injection History"},
-        {"rank": 15, "name": "flask/flask", "risk": 58.9, "reason": "Debug Mode Risks"}
+        {"rank": 1, "name": "apache/struts", "risk": 85.2, "reason": "High Vulnerability Count"},
+        {"rank": 2, "name": "fastjson/fastjson", "risk": 82.8, "reason": "Frequent RCE Exploits"},
+        {"rank": 3, "name": "log4j/log4j2", "risk": 78.5, "reason": "Critical Legacy Issues"},
+        {"rank": 4, "name": "openssl/openssl", "risk": 75.1, "reason": "Heartbleed History"},
+        {"rank": 5, "name": "jenkins/jenkins", "risk": 72.4, "reason": "Plugin Security Risks"},
+        {"rank": 6, "name": "struts/struts2", "risk": 70.9, "reason": "Old Vulnerabilities"},
+        {"rank": 7, "name": "spring/spring-framework", "risk": 68.3, "reason": "Complex Dependencies"},
+        {"rank": 8, "name": "axios/axios", "risk": 65.6, "reason": "SSRF Risks"},
+        {"rank": 9, "name": "lodash/lodash", "risk": 62.1, "reason": "Prototype Pollution"},
+        {"rank": 10, "name": "moment/moment", "risk": 60.8, "reason": "Maintenance Mode"},
+        {"rank": 11, "name": "express/express", "risk": 58.4, "reason": "Middleware Risks"},
+        {"rank": 12, "name": "vuejs/vue", "risk": 25.7, "reason": "XSS Vectors (Active)"},
+        {"rank": 13, "name": "angular/angular", "risk": 22.3, "reason": "Complexity (Active)"},
+        {"rank": 14, "name": "django/django", "risk": 20.5, "reason": "SQL Injection History (Active)"},
+        {"rank": 15, "name": "flask/flask", "risk": 18.9, "reason": "Debug Mode Risks (Active)"}
     ]
     
     # Try to inject recently analyzed high-risk projects from cache
