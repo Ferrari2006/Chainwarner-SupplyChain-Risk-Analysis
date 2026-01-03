@@ -778,28 +778,72 @@ async def get_dependency_graph(owner: str, repo: str):
     # --- 6. Fusion & Response Construction ---
     final_nodes = []
     
-    for i, n_id in enumerate(node_list):
-        # Retrieve Pre-calculated Base Risk (from Data Collection Phase)
-        # We stored it in nodes_data initially
+    # RISK PROPAGATION ALGORITHM (User Requested)
+    # Step 1: Initialize propagation map with base risks
+    # Base risk is already calculated in node_obj['risk_score'] from (Activity + Rank + CVE)
+    
+    # Map node_id -> current_propagated_risk
+    prop_risk_map = {}
+    
+    # Initialize with self-risk
+    for n_id in node_list:
         node_obj = next((x for x in nodes_data if x['id'] == n_id), None)
+        # Re-calculate Base Risk using V3 Formula (Activity > Rank)
+        # We need to ensure consistency with what was calculated during fetch
         base_risk = node_obj['risk_score'] if node_obj else 0.5
+        prop_risk_map[n_id] = base_risk
+
+    # Step 2: Propagate Risk (Child -> Parent)
+    # Iterative approach to handle deep chains (limit 3 iterations for DAG-like structures)
+    # Logic: ParentRisk = Max(ParentSelfRisk, Max(ChildRisk * Decay))
+    # User said: "NodeColor = min(SelfScore, min(DependencyScores))" -> He meant Health Score.
+    # In Risk Score (High=Bad), this means: NodeRisk = Max(SelfRisk, Max(ChildRisk))
+    # We add a slight decay factor (0.9) for indirect dependencies so root isn't always 1.0
+    
+    adjacency = {n: [] for n in node_list}
+    for e in edges_data:
+        if e['source'] in adjacency:
+            adjacency[e['source']].append(e['target'])
+            
+    # Reverse topological propagation (or just loop for simplicity)
+    for _ in range(3): # 3 passes is enough for most depth
+        changes = 0
+        for n_id in node_list:
+            current_risk = prop_risk_map[n_id]
+            children = adjacency.get(n_id, [])
+            
+            # Find max child risk
+            max_child_risk = 0.0
+            for child_id in children:
+                # If child is in graph
+                if child_id in prop_risk_map:
+                    max_child_risk = max(max_child_risk, prop_risk_map[child_id])
+            
+            # Propagation Logic: Risk = Max(Self, Child * 1.0) -> Strict "Wooden Barrel"
+            # If a dependency is critical (0.9), I am critical (0.9)
+            new_risk = max(current_risk, max_child_risk)
+            
+            if abs(new_risk - current_risk) > 0.01:
+                prop_risk_map[n_id] = new_risk
+                changes += 1
+        if changes == 0:
+            break
+
+    for i, n_id in enumerate(node_list):
+        node_obj = next((x for x in nodes_data if x['id'] == n_id), None)
         
-        # 2. Topology Metrics (From EasyGraph)
+        # Use Propagated Risk
+        final_risk = prop_risk_map.get(n_id, 0.5)
+        
+        # 2. Topology Metrics (From EasyGraph) - Optional Boost
         constraint_val = eg_metrics.get('constraint', {}).get(n_id, 0)
-        # Normalize constraint (usually 0-1, but can be higher)
-        score_constraint = min(1.0, constraint_val)
         
-        betweenness_val = eg_metrics.get('betweenness', {}).get(n_id, 0)
-        # Normalize betweenness (usually small)
-        score_centrality = min(1.0, betweenness_val * 5.0) # Boost for visibility
-        cve_count = node_obj.get('cve_count', 0)
-        cve_risk = min(1.0, cve_count * 0.1)
-        # 3. Weighted Fusion Model
-        # Fusion: 60% Base + 20% Constraint + 10% Centrality + 10% CVE
-        final_risk = (base_risk * 0.6) + (score_constraint * 0.2) + (score_centrality * 0.1) + (cve_risk * 0.1)
-        
+        # Ensure bounds
         final_risk = min(1.0, max(0.0, final_risk))
-        desc_text = f"Constraint: {constraint_val:.2f} | CVEs: {cve_count} | Risk: {final_risk * 100:.1f}"
+        
+        # Description Update
+        cve_count = node_obj.get('cve_count', 0)
+        desc_text = f"Risk: {final_risk * 100:.1f} (Propagated) | CVEs: {cve_count}"
         
         # Generate History (Deterministic: flat series based on final risk)
         history = []
